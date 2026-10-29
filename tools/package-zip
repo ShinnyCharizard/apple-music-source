@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+"""Archive the verified package within Plugin's plugin size limits."""
+import hashlib
+import json
+from pathlib import Path
+import sys
+import zipfile
+
+root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(root / "src"))
+from apple_music_plugin.fairplay import inventory
+
+manifest = json.loads((root / "manifest.json").read_text())
+package = root / "dist" / (manifest["version"] + "-x86_64-unknown-linux-gnu")
+archive = Path(str(package) + ".zip")
+if not package.is_dir() or archive.exists():
+    raise SystemExit("Build the package first; do not overwrite an existing ZIP")
+vendor = {name for name, _, _ in inventory()[1]}
+files = sorted(path for path in package.rglob("*") if path.is_file())
+if any(path.is_symlink() for path in package.rglob("*")):
+    raise SystemExit("Symlinks are not allowed in a plugin ZIP")
+if any(path.name in vendor for path in files):
+    raise SystemExit("Apple libraries cannot be included in a plugin ZIP")
+if any(path.stat().st_size > 32 * 1024 * 1024 for path in files):
+    raise SystemExit("A package file exceeds the host's 32 MiB limit")
+expanded = sum(path.stat().st_size for path in files)
+if expanded > 128 * 1024 * 1024:
+    raise SystemExit("The package exceeds the host's 128 MiB expanded limit")
+try:
+    with zipfile.ZipFile(archive, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as output:
+        for path in files:
+            output.write(path, arcname=path.relative_to(package.parent))
+    if archive.stat().st_size > 64 * 1024 * 1024:
+        raise SystemExit("The ZIP exceeds the host's 64 MiB archive limit")
+except BaseException:
+    archive.unlink(missing_ok=True)
+    raise
+print(archive)
+print("Expanded bytes:", expanded)
+print("SHA256", hashlib.sha256(archive.read_bytes()).hexdigest())

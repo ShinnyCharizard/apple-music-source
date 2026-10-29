@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""I load the exact package in an isolated native host without account or audio."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import stat
+import subprocess
+import tempfile
+import zipfile
+
+
+QML = '''import QtQuick
+import QtQuick.Window
+import @HOST_MODULE@
+Window {
+    id: window
+    visible: true
+    width: 640
+    height: 480
+    readonly property bool playing: Player.playing
+    property int step: 0
+    SettingsPage { id: page; section: "plugins" }
+    function fail(message) { console.error("SMOKE FAIL native package: " + message); Qt.exit(1) }
+    Timer {
+        interval: 100; repeat: true; running: true
+        onTriggered: {
+            if (window.playing) return window.fail("unexpected playback")
+            const state = JSON.parse(page.pluginsJson())
+            if (state.busy || state.working) return
+            const installed = (state.installed || []).find(row => row.id === "PLUGIN_ID")
+            if (!installed) return
+            if (!installed.native || !installed.enabled || installed.state !== "fine" || installed.problem)
+                return window.fail("the exact packaged worker did not load")
+            if (installed.version !== "PLUGIN_VERSION") return window.fail("another version loaded")
+            if (!window.step) {
+                window.step = 1
+                page.pluginCommand("settings", JSON.stringify({id: "PLUGIN_ID"}))
+            } else if (state.settings_id === "PLUGIN_ID" && !state.settings_loading_id) {
+                const form = state.form || {}
+                const actions = form.form?.actions || []
+                if (state.error || !actions.some(action => action.key === "install_components"))
+                    return window.fail("the package did not expose the explicit component install action")
+                if ((form.links || []).length) return window.fail("sign-in opened before component installation")
+                console.log("SMOKE native package completed: exact version, host approval, sandbox, explicit install, no account/audio")
+                Qt.quit()
+            }
+        }
+    }
+    Timer { interval: 30000; running: true; onTriggered: window.fail("timed out") }
+}
+'''
+
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("binary", type=Path)
+parser.add_argument("package", type=Path)
+parser.add_argument("output", type=Path)
+parser.add_argument("--host-id", required=True)
+parser.add_argument("--host-module", required=True)
+parser.add_argument("--smoke-env", required=True)
+parser.add_argument("--renderer-env", required=True)
+args = parser.parse_args()
+binary, package, output = args.binary.resolve(strict=True), args.package.resolve(strict=True), args.output.resolve()
+output.mkdir(parents=True, exist_ok=True)
+with tempfile.TemporaryDirectory(prefix="plugin-native-package-") as temporary:
+    profile = Path(temporary)
+    for name in (f"config/{args.host_id}", "cache", "runtime", f"data/{args.host_id}/plugins"):
+        (profile/name).mkdir(parents=True)
+    (profile/"runtime").chmod(0o700)
+    (profile/f"config/{args.host_id}/settings.conf").write_text("output = file:capture\nlanguage = es\n")
+    with zipfile.ZipFile(package) as archive:
+        manifests = [name for name in archive.namelist() if PurePosixPath(name).name == "manifest.json"]
+        assert len(manifests) == 1, "one manifest is required"
+        root = PurePosixPath(manifests[0]).parent
+        manifest = json.loads(archive.read(manifests[0]))
+        identity = manifest["id"]
+        assert manifest["runtime"] == "process" and "/" not in identity and ".." not in identity
+        installed = profile/f"data/{args.host_id}/plugins"/identity
+        for member in archive.infolist():
+            path = PurePosixPath(member.filename)
+            assert not path.is_absolute() and ".." not in path.parts and "\\" not in member.filename
+            assert path.is_relative_to(root) and not stat.S_ISLNK(member.external_attr >> 16)
+            if member.is_dir(): continue
+            target = installed/str(path.relative_to(root))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(archive.read(member))
+            target.chmod((member.external_attr >> 16) & 0o777 or 0o600)
+    approval = {key: manifest.get(key) for key in ("kind", "runtime", "capabilities", "auth")}
+    (installed.parent/"approvals.json").write_text(json.dumps({identity: approval}))
+    fixture = profile/"smoke.qml"
+    fixture.write_text(QML.replace("@HOST_MODULE@", args.host_module).replace('"PLUGIN_ID"', json.dumps(identity)).replace('"PLUGIN_VERSION"', json.dumps(manifest["version"])))
+    environment = dict(os.environ, XDG_CONFIG_HOME=str(profile/"config"), XDG_CACHE_HOME=str(profile/"cache"),
+        XDG_DATA_HOME=str(profile/"data"), XDG_RUNTIME_DIR=str(profile/"runtime"), QT_QPA_PLATFORM="offscreen",
+        QT_NO_XDG_DESKTOP_PORTAL="1")
+    environment[args.renderer_env] = "software"
+    environment[args.smoke_env] = str(fixture)
+    result = subprocess.run(["timeout", "--kill-after=2s", "40s", "dbus-run-session", "--", str(binary)],
+        env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    (output/"native-host.log").write_text(result.stdout)
+    passed = (result.returncode == 0 and "SMOKE native package completed" in result.stdout
+        and not any(error in result.stdout for error in ("SMOKE FAIL", "TypeError:", "ReferenceError:", "is not a type")))
+    with binary.open("rb") as stream:
+        binary_hash = hashlib.file_digest(stream, "sha256").hexdigest()
+    report = {"passed": passed, "binary": str(binary), "binary_sha256": binary_hash,
+              "package": str(package), "package_sha256": hashlib.sha256(package.read_bytes()).hexdigest(),
+              "plugin": identity, "version": manifest["version"], "exit_code": result.returncode}
+    (output/"report.json").write_text(json.dumps(report, indent=2)+"\n")
+    print("\n".join(line for line in result.stdout.splitlines() if "SMOKE" in line))
+    if not passed:
+        print(result.stdout)
+        raise SystemExit(1)

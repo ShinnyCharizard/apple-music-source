@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""One invalid-account diagnostic in an isolated engine, with filtered output."""
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
+import time
+
+root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(root/'src'))
+from apple_music_plugin.engine import Engine
+
+# This diagnostic runs only with its built-in nonexistent fixture identity.
+# Do not add account parameters or point it at an existing profile.
+def trace(self, child):
+    try:
+        while line := child.stderr.readline(2049):
+            if len(line) >= 2049:
+                continue
+            if re.fullmatch(rb'[^\s()]+\([^\n]*\) \[0x[0-9a-f]+\]\n', line):
+                print('TRACE '+line.decode().strip(), flush=True)
+            if re.fullmatch(rb'\[plugin-auth\] (?:credentials=(?:password|challenge)|response_type=-?[0-9]{1,10}|external_error=-?[0-9]{1,19}|dialog=(?:existing_account|unsupported))\n', line):
+                print(line.decode().strip(), flush=True)
+            code = re.match(rb"\[!\] auth error: code=(-?[0-9]{1,10}),", line)
+            if code:
+                print('AUTH_CODE '+code[1].decode(), flush=True)
+            if line.startswith((b"[!] auth error:", b"[guard]", b"[!] server message:")):
+                lower = line.lower()
+                for category, words in (("tls", (b"certificate", b"ssl", b"tls")), ("network", (b"network", b"connect", b"timeout")), ("account", (b"password", b"credentials", b"account"))):
+                    if any(word in lower for word in words):
+                        print('CATEGORY '+category, flush=True)
+                        break
+            for prefix, name in ((b'[cp21]', 'context_ready'), (b'[+] logging in...', 'authenticating'),
+                                 (b'[drm_lib] login failed', 'login_failed'),
+                                 (b'fatal error:', 'go_fatal'), (b'runtime: out of memory', 'go_memory')):
+                if line.startswith(prefix):
+                    print('STAGE '+name, flush=True)
+    finally:
+        child.stderr.close()
+Engine._diagnostics = trace
+with tempfile.TemporaryDirectory(prefix='engine-probe-') as temporary:
+    engine = Engine(temporary, root/'runtime')
+    try:
+        engine.request('POST', '/drm/authenticate', {'email': 'fixture@example.invalid', 'password': 'intentionally-invalid'})
+        deadline = time.monotonic()+40
+        while time.monotonic() < deadline:
+            if engine.child.poll() is not None:
+                print('EXIT '+str(engine.child.returncode), flush=True)
+                break
+            state = engine._json('GET', '/drm/status').get('state', {})
+            if state.get('manager') == 'failed':
+                print('RESULT controlled_failure', flush=True)
+                break
+            time.sleep(.25)
+        else:
+            print('RESULT timeout', flush=True)
+    finally:
+        engine.close()

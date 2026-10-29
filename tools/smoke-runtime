@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""Exercise an isolated runtime without credentials or audio output."""
+import http.client
+from pathlib import Path
+import shutil
+import ssl
+import sys
+import tempfile
+
+root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(root / "src"))
+from apple_music_plugin.engine import Engine
+
+with tempfile.TemporaryDirectory(prefix="plugin-apple-smoke-") as temporary:
+    engine = Engine(temporary, root / "runtime")
+    try:
+        # Stage only verified local build inputs in this disposable profile.
+        # An installed package still requires the user's explicit download.
+        engine.components.library_dir.mkdir(parents=True)
+        for name, size, digest in engine.components.entries:
+            source = root / "runtime/drm/rootfs/system/lib64" / name
+            assert engine.components._matches(source, size, digest), "The local build input differs from the lock"
+            shutil.copy2(source, engine.components.library_dir / name)
+        engine.components._companions()
+        assert engine.components.ready()
+        status = engine.request("GET", "/status")
+        drm = engine.request("GET", "/drm/status")
+        assert drm.get("backend", {}).get("selected") == "native", "The FairPlay backend must be native"
+        port, context = engine.port, engine.context
+        child, work = engine.child, engine.work
+        conn = http.client.HTTPSConnection("127.0.0.1", port, context=context, timeout=5)
+        conn.request("GET", "/api/v1/status")
+        response = conn.getresponse()
+        assert response.status == 401, "The SDK must reject requests without its private token"
+        conn.close()
+        for method, path in [("GET", "/api/v1/export"), ("POST", "/api/v1/vlc/load"), ("GET", "/api/v1/debug/runtime")]:
+            conn = http.client.HTTPSConnection("127.0.0.1", port, context=context, timeout=5)
+            conn.request(method, path, headers={"Authorization": "Bearer " + engine.token})
+            response = conn.getresponse()
+            assert response.status == 404, "An excluded SDK route is still reachable"
+            conn.close()
+        # I verify the routes exist, require the private API token, and do not
+        # submit anything without an account or a valid measured interval.
+        for method, path, expected in [("GET", "/api/v1/reporting/account", 401), ("POST", "/api/v1/reporting/play", 400)]:
+            conn = http.client.HTTPSConnection("127.0.0.1", port, context=context, timeout=5)
+            conn.request(method, path, body="{}", headers={"Authorization": "Bearer " + engine.token, "Content-Type": "application/json"})
+            response = conn.getresponse()
+            assert response.status == expected, "The listening route is missing or accepts an invalid report"
+            conn.close()
+        conn = http.client.HTTPSConnection("127.0.0.1", port, timeout=5)
+        try:
+            conn.request("GET", "/api/v1/status")
+            raise AssertionError("The self-signed runtime certificate unexpectedly used global trust")
+        except ssl.SSLCertVerificationError:
+            pass
+        finally:
+            conn.close()
+        assert (work / "engine.pem").stat().st_mode & 0o777 == 0o600
+        print("PASS: native backend, private TLS certificate, API authentication, excluded routes")
+    finally:
+        engine.close()
+    assert child.poll() is not None and not work.exists()
+    print("PASS: child shutdown and temporary cache removal; no account or audio used")

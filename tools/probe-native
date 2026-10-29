@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""Probe the native library with an empty disposable account, without login."""
+import ctypes
+import os
+import re
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+runtime = Path(__file__).resolve().parents[1] / 'runtime'
+if len(sys.argv) == 1 or sys.argv[1].startswith("--"):
+    with tempfile.TemporaryDirectory(prefix='plugin-apple-native-probe-') as temp:
+        env = dict(os.environ, DEBUGINFOD_URLS="", HOME=temp, XDG_CONFIG_HOME=temp, MUSICKIT_DRM_DIR=str(runtime/'drm'))
+        if "--trace" in sys.argv:
+            env["LD_PRELOAD"] = "/tmp/plugin-native-trace.so"
+        try:
+            command = [sys.executable, __file__, temp]
+            if "--invalid-account" in sys.argv:
+                command.append("--invalid-account")
+            if "--debug" in sys.argv:
+                command = ["gdb", "-nx", "--batch", "-iex", "set debuginfod enabled off", "-iex", "set auto-load off", "-iex", "set auto-solib-add off", "-ex", "set print thread-events off", "-ex", "set print frame-arguments none", "-ex", "run", "-ex", "sharedlibrary libdrm_client.so", "-ex", "bt 16", "--args"] + command
+            result = subprocess.run(command, env=env, capture_output=True, timeout=45)
+            # Only emit our fixed diagnostic vocabulary, never arbitrary vendor logs.
+            allowed = {b'PROBE libraries=0', b'PROBE libraries=-1', b'PROBE account=0', b'PROBE account=-1', b'PROBE loading', b'PROBE loaded'}
+            for line in result.stdout.splitlines():
+                if line in allowed or line.startswith(b'PROBE loader_error=') or (b'--debug' in [x.encode() for x in sys.argv] and line.startswith(b'#')):
+                    print(line.decode())
+            if "--trace" in sys.argv:
+                for line in result.stderr.splitlines():
+                    if re.fullmatch(rb"[^\s()]+\([^\n]*\) \[0x[0-9a-f]+\]", line):
+                        print(line.decode(errors="replace"))
+            for match in re.finditer(rb"\[!\] auth error: code=(-?[0-9]{1,10}),", result.stderr):
+                print('PROBE auth_error=' + match[1].decode())
+            checkpoints = re.findall(rb"\[(cp[0-9]+|main-cp[0-9]+)\]", result.stderr)
+            print('PROBE checkpoints=' + ','.join(x.decode() for x in checkpoints))
+            print('PROBE exit=' + str(result.returncode))
+        except subprocess.TimeoutExpired as error:
+            for line in (error.stdout or b'').splitlines():
+                if line.startswith((b'PROBE ', b'#')):
+                    print(line.decode(errors='replace'))
+            checkpoints = re.findall(rb"\[(cp[0-9]+|main-cp[0-9]+)\]", error.stderr or b'')
+            print('PROBE checkpoints=' + ','.join(x.decode() for x in checkpoints))
+            print('PROBE timeout=45s')
+else:
+    os.umask(0o077)
+    session = Path(sys.argv[1])/'session'
+    session.mkdir()
+    (session/'mpl_db').mkdir()
+    print('PROBE loading', flush=True)
+    try:
+        lib = ctypes.CDLL(str(runtime/'libdrm_client.so'))
+    except OSError as error:
+        print('PROBE loader_error=' + str(error), flush=True)
+        sys.exit(1)
+    print('PROBE loaded', flush=True)
+    lib.hybris_backend_init.argtypes = [ctypes.c_char_p]*3
+    lib.hybris_backend_init.restype = ctypes.c_int
+    rc = lib.hybris_backend_init(os.fsencode(runtime/'drm/hybris-linker'), os.fsencode(runtime/'drm/rootfs/system/lib64'), b'')
+    print('PROBE libraries='+str(rc), flush=True)
+    if rc:
+        sys.exit(1)
+    lib.hybris_fairplay_init.argtypes = [ctypes.c_char_p]*5
+    lib.hybris_fairplay_init.restype = ctypes.c_int
+    rc = lib.hybris_fairplay_init(os.fsencode(session), b'', os.fsencode(runtime/'drm/rootfs/system/lib64'), b'fixture@example.invalid' if '--invalid-account' in sys.argv else None, b'intentionally-invalid' if '--invalid-account' in sys.argv else None)
+    print('PROBE account='+str(rc), flush=True)
+
+    # Vendor worker threads are process-owned; this probe has no shutdown API.
+    os._exit(0 if rc == -1 else 1)

@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""Read catalog metadata through the running plugin; never print credentials."""
+import http.client
+import json
+import os
+from pathlib import Path
+import ssl
+import sys
+
+# Read only the plugin engine's private API transport credentials into memory.
+# Never inspect account files, print environment values or dump API responses.
+for process in Path('/proc').iterdir():
+    if not process.name.isdigit():
+        continue
+    try:
+        if process.stat().st_uid != os.getuid():
+            continue
+        command = (process/'cmdline').read_bytes().split(b'\0')
+        if not command or not command[0].endswith(b'/musickit-engine') or b'--api' not in command:
+            continue
+        namespace = process/'root'
+        manifest = json.loads((namespace/'plugin/manifest.json').read_text())
+        if manifest.get('id') != 'io.github.shinnycharizard.apple-music':
+            continue
+        environment = dict(part.split(b'=', 1) for part in (process/'environ').read_bytes().split(b'\0') if b'=' in part)
+        token = environment[b'MUSICKIT_API_TOKEN'].decode()
+        certificate = namespace/os.fsdecode(environment[b'MUSICKIT_CERT_FILE']).lstrip('/')
+        context = ssl.create_default_context(cafile=str(certificate))
+        port = int(command[command.index(b'--api')+1])
+        break
+    except (OSError, ValueError, KeyError):
+        continue
+else:
+    raise SystemExit('No running installed plugin engine found')
+paths = sys.argv[1:] or ['/drm/status', '/metadata/1440833098?sf=us']
+for path in paths:
+    if not path.startswith(('/drm/status', '/metadata/', '/catalog/')) or '\n' in path:
+        raise SystemExit('Only read-only catalog/status operations are supported')
+    connection = http.client.HTTPSConnection('127.0.0.1', port, context=context, timeout=30)
+    try:
+        connection.request('GET', '/api/v1'+path, headers={'Authorization': 'Bearer '+token})
+        response = connection.getresponse()
+        raw = response.read(8*1024*1024+1)
+        report = {'http_status': response.status, 'operation': path.split('?')[0]}
+        if response.status == 200 and len(raw) <= 8*1024*1024:
+            value = json.loads(raw)
+            if path == '/drm/status':
+                state = value.get('state', {})
+                report['ready'] = state.get('authentication') == 'logged_in' and state.get('fairplay') == 'ready'
+            else:
+                report.update(type=value.get('type'), has_title=bool(value.get('title')), rows=len(value.get('data', [])))
+                if 'section=library&' in path or path.endswith('section=library'):
+                    report['playlists'] = [{'id': row.get('id'), 'title': row.get('attributes', {}).get('name'),
+                                            'in_library': row.get('attributes', {}).get('inLibrary'),
+                                            'favorite': row.get('attributes', {}).get('inFavorites')}
+                                           for row in value.get('data', [])]
+                if 'section=songs' in path:
+                    report['songs'] = [{'id': row.get('id'), 'play_params': bool(row.get('attributes', {}).get('playParams')),
+                                        'audio_traits': row.get('attributes', {}).get('audioTraits', []),
+                                        'playback_keys': sorted(row.get('attributes', {}).get('playParams', {}).keys())}
+                                       for row in value.get('data', [])]
+                songs = value.get('results', {}).get('songs', {}).get('data', [])
+                if songs:
+                    report['first_catalog_id'] = songs[0].get('id')
+        print(json.dumps(report))
+    except Exception:
+        print(json.dumps({'operation': path.split('?')[0], 'transport_failed': True}))
+    finally:
+        connection.close()

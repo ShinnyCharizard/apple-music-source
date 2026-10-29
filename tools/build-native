@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""Build a Linux plugin package without redistributing Apple binaries."""
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(root / "src"))
+from apple_music_plugin.fairplay import COMPANIONS, FairPlayComponents, inventory
+
+runtime = root / "runtime"
+if not (runtime / "plugin-runtime.json").is_file():
+    raise SystemExit("Build the pinned FairPlay runtime first")
+_, vendor = inventory()
+library_dir = runtime / "drm/rootfs/system/lib64"
+if {path.name for path in library_dir.iterdir()} != {name for name, _, _ in vendor} | set(COMPANIONS):
+    raise SystemExit("Unexpected FairPlay runtime libraries; review before packaging")
+for name, size, digest in vendor:
+    if not FairPlayComponents._matches(library_dir / name, size, digest):
+        raise SystemExit(f"Pinned FairPlay checksum differs: {name}")
+subprocess.run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--onedir",
+                "--name", "plugin", "--paths", str(root / "src"), "--strip",
+                "--add-data", str(root / "src/apple_music_plugin/fairplay-libs.lock") + ":apple_music_plugin",
+                "--add-data", str(root / "src/apple_music_plugin/fairplay-sizes.json") + ":apple_music_plugin",
+                "--distpath", str(root / "build/package"), "--workpath", str(root / "build/work"),
+                "--specpath", str(root / "build"), str(root / "src/main.py")], cwd=root, check=True)
+manifest = json.loads((root / "manifest.json").read_text())
+target = root / "dist" / (manifest["version"] + "-x86_64-unknown-linux-gnu")
+if target.exists():
+    raise SystemExit("Build destination already exists; keep or move it before rebuilding")
+shutil.copytree(root / "build/package/plugin", target)
+vendor_names = {name for name, _, _ in vendor}
+shutil.copytree(runtime, target / "runtime", ignore=lambda directory, names:
+                vendor_names & set(names) if Path(directory) == library_dir else set())
+if {path.name for path in (target / "runtime/drm/rootfs/system/lib64").iterdir()} != set(COMPANIONS):
+    raise SystemExit("Apple libraries entered the package")
+shutil.copytree(root / "src", target / "source", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+for name in ("manifest.json", "icon.svg", "folder.svg", "COPYING", "NOTICE", "README.md"):
+    shutil.copy2(root / name, target / name)
+shutil.copy2(root / "icon.svg", target / ".host-icon.svg")
+shutil.copy2(root / "folder.svg", target / ".host-folder-icon.svg")
+(target / "dependencies.txt").write_bytes(subprocess.check_output([sys.executable, "-m", "pip", "freeze"]))
+print(target)
+print("SHA256 " + hashlib.sha256((target / "plugin").read_bytes()).hexdigest())

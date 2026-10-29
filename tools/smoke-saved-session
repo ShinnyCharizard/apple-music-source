@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""Run the packaged plugin under the host's native sandbox, with the existing signed-in profile; never signs in or out."""
+import http.client
+import json
+import os
+from pathlib import Path
+import selectors
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import urlsplit
+
+package = Path(sys.argv[1]).resolve()
+with tempfile.TemporaryDirectory(prefix='plugin-apple-package-') as temporary:
+    data = Path(os.environ['PLUGIN_DATA_DIR']).resolve()
+    assert data.is_dir(), 'Existing profile is required'
+    cache = Path(temporary)/'cache'
+    cache.mkdir(mode=0o700)
+    command = ['bwrap', '--unshare-all', '--share-net', '--die-with-parent', '--new-session', '--cap-drop', 'ALL',
+               '--ro-bind', '/usr', '/usr', '--symlink', 'usr/lib', '/lib', '--symlink', 'usr/lib64', '/lib64',
+               '--symlink', 'usr/bin', '/bin', '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp']
+    for item in ['ssl', 'ca-certificates', 'pki', 'resolv.conf', 'hosts', 'nsswitch.conf', 'ld.so.cache', 'ld.so.conf', 'ld.so.conf.d']:
+        command += ['--ro-bind-try', '/etc/'+item, '/etc/'+item]
+    command += ['--ro-bind', str(package), '/plugin', '--bind', str(data), '/data', '--bind', str(cache), '/cache',
+                '--chdir', '/data', '--clearenv', '--setenv', 'PATH', '/usr/bin', '--setenv', 'HOME', '/data',
+                '--setenv', 'XDG_CACHE_HOME', '/cache', '--setenv', 'SSL_CERT_DIR', '/etc/ssl/certs',
+                '--', '/usr/bin/prlimit', '--as=2147483648', '--nofile=256', '--core=0', '--', '/plugin/plugin']
+    child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    try:
+        def call(identifier, method, params=None):
+            child.stdin.write(json.dumps({'jsonrpc': '2.0', 'id': identifier, 'method': method, 'params': params or {}})+'\n')
+            child.stdin.flush()
+            with selectors.DefaultSelector() as ready:
+                ready.register(child.stdout, selectors.EVENT_READ)
+                assert ready.select(40), 'Packaged RPC timed out'
+            result = json.loads(child.stdout.readline())
+            if 'error' in result:
+                print('RPC failure:', method, str(result['error'].get('message', ''))[:300], flush=True)
+                if method == 'track.resolve':
+                    subprocess.run([sys.executable, str(Path(__file__).with_name('probe-playback-failure')), params['ref'].split(':')[-1]], check=False)
+            assert result.get('id') == identifier and 'error' not in result, 'Packaged RPC failed'
+            return result['result']
+        assert call(1, 'initialize')['capabilities']['settings'] is True
+        deadline = time.monotonic() + 35
+        while not call(2, 'auth.status').get('signed_in'):
+            assert time.monotonic() < deadline, 'Saved session did not become ready'
+            time.sleep(.5)
+        print('PASS: saved session resumed', flush=True)
+        if len(sys.argv) > 2:
+            import re
+            assert all(re.fullmatch(r'track:[a-z]{2}:[0-9]{1,24}', ref) for ref in sys.argv[2:])
+            tracks = [{'ref': ref} for ref in sys.argv[2:]]
+        else:
+            results = call(3, 'search', {'text': 'Iron Maiden Where Eagles Dare'})
+            albums = [row for row in results['albums'] if row['artist'] == 'Iron Maiden' and 'Piece of Mind' in row['title']]
+            assert albums, 'Expected album was not found'
+            assert all(row['ref'].split(':')[1] == 'mx' for row in results['tracks'] + results['albums'])
+            album = call(4, 'album.get', {'ref': albums[0]['ref']})
+            tracks = album['tracks'][:2]
+            assert len(tracks) == 2
+        streams = [call(5+i, 'track.resolve', {'ref': row['ref']}) for i, row in enumerate(tracks)]
+        print('PASS: playback resolutions', len(streams), flush=True)
+        for row, stream in zip(tracks, streams):
+            parsed = urlsplit(stream['url'])
+            assert parsed.hostname == '127.0.0.1'
+            conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=60)
+            conn.request('HEAD', parsed.path)
+            response = conn.getresponse()
+            assert response.status == 200, 'Audio HEAD failed'
+            length = int(response.getheader('Content-Length'))
+            response.read()
+            conn.close()
+            conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=60)
+            conn.request('GET', parsed.path, headers={'Range': 'bytes=0-63'})
+            response = conn.getresponse()
+            assert response.status == 206 and len(response.read()) == 64, 'Audio range failed'
+            conn.close()
+            conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=60)
+            conn.request('GET', parsed.path)
+            response = conn.getresponse()
+            assert response.status == 200
+            decoder = subprocess.Popen(['ffmpeg', '-v', 'error', '-xerror', '-i', 'pipe:0', '-f', 'null', '-'], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            received = 0
+            try:
+                while chunk := response.read(65536):
+                    received += len(chunk)
+                    decoder.stdin.write(chunk)
+                decoder.stdin.close()
+                assert decoder.wait(timeout=30) == 0, 'Full-track decode failed'
+            finally:
+                if decoder.poll() is None:
+                    decoder.kill()
+                    decoder.wait()
+                conn.close()
+            assert received == length
+            print('PASS: full decode and byte ranges', row['ref'], stream['format']['codec'], received, flush=True)
+        assert call(9, 'auth.status')['signed_in'], 'Engine died after playback'
+        child.stdin.close()
+        assert child.wait(timeout=15) == 0
+        assert not list((data/'temporary').glob('run-*'))
+        print('PASS: packaged audio, original 2 GiB sandbox, saved session and clean shutdown; no DAC', flush=True)
+    finally:
+        if child.poll() is None:
+            child.stdin.close()
+            try:
+                child.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()

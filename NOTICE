@@ -1,0 +1,17 @@
+This adapter is distributed under GPL-3.0-or-later; see COPYING.
+
+Integrated musickit-sdk-linux at revision
+1f8f7ac3137f93a1eb5097ac10a675af48c0166f (SilentOne, MIT).
+Source: https://github.com/silentone12725/musickit-sdk-linux
+Its wrapper and library notices are retained in the locally built runtime.
+The Apple and Android native binaries retain their respective licenses;
+the SDK's MIT license does not cover them.
+
+Provider authentication, FairPlay, caching and delivery stay inside this
+plugin. A line-oriented native process contract connects it to the player.
+
+Adapted the long-token JSON serializer and recovery-worker lifecycle fixes
+from apple-music-linux pull request #1, head
+0f8f419c855bcafcea7cc76241da925be89e651b. The accompanying native regression
+fixtures originate in that PR. The native wrapper notices are retained.
+Source: https://github.com/silentone12725/apple-music-linux/pull/1

@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Run the packaged plugin under the host's native sandbox, with the existing signed-in profile; never signs in or out."""
+import http.client
+import json
+import os
+from pathlib import Path
+import selectors
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import urlsplit
+
+package = Path(sys.argv[1]).resolve()
+with tempfile.TemporaryDirectory(prefix='plugin-apple-package-') as temporary:
+    data = Path(os.environ['PLUGIN_DATA_DIR']).resolve()
+    assert data.is_dir(), 'Existing profile is required'
+    cache = Path(temporary)/'cache'
+    cache.mkdir(mode=0o700)
+    command = ['bwrap', '--unshare-all', '--share-net', '--die-with-parent', '--new-session', '--cap-drop', 'ALL',
+               '--ro-bind', '/usr', '/usr', '--symlink', 'usr/lib', '/lib', '--symlink', 'usr/lib64', '/lib64',
+               '--symlink', 'usr/bin', '/bin', '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp']
+    for item in ['ssl', 'ca-certificates', 'pki', 'resolv.conf', 'hosts', 'nsswitch.conf', 'ld.so.cache', 'ld.so.conf', 'ld.so.conf.d']:
+        command += ['--ro-bind-try', '/etc/'+item, '/etc/'+item]
+    command += ['--ro-bind', str(package), '/plugin', '--bind', str(data), '/data', '--bind', str(cache), '/cache',
+                '--chdir', '/data', '--clearenv', '--setenv', 'PATH', '/usr/bin', '--setenv', 'HOME', '/data',
+                '--setenv', 'XDG_CACHE_HOME', '/cache', '--setenv', 'SSL_CERT_DIR', '/etc/ssl/certs',
+                '--', '/usr/bin/prlimit', '--as=2147483648', '--nofile=256', '--core=0', '--', '/plugin/plugin']
+    if '--source' in sys.argv:
+        command[-1:] = ['/usr/bin/python3', '/plugin/src/main.py']
+    child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    try:
+        def call(identifier, method, params=None):
+            child.stdin.write(json.dumps({'jsonrpc': '2.0', 'id': identifier, 'method': method, 'params': params or {}})+'\n')
+            child.stdin.flush()
+            with selectors.DefaultSelector() as ready:
+                ready.register(child.stdout, selectors.EVENT_READ)
+                assert ready.select(40), 'Packaged RPC timed out'
+            result = json.loads(child.stdout.readline())
+            if 'error' in result:
+                print('RPC failure:', method, str(result['error'].get('message', ''))[:300], flush=True)
+            assert result.get('id') == identifier and 'error' not in result, 'Packaged RPC failed'
+            return result['result']
+        assert call(1, 'initialize')['capabilities']['settings'] is True
+        if '--cold' not in sys.argv:
+            deadline = time.monotonic() + 35
+            while not call(2, 'auth.status').get('signed_in'):
+                assert time.monotonic() < deadline, 'Saved session did not become ready'
+                time.sleep(.5)
+            print('PASS: saved session resumed', flush=True)
+        if '--library-first' in sys.argv:
+            assert call(20, 'library.list', {'kind': 'playlists', 'limit': 500})['items']
+            print('PASS: cold sidebar library request (host limit 500)', flush=True)
+        page = call(3, 'page.get', {'ref': 'discover:home', 'refresh': True})
+        assert page['personal'] is True
+        assert page['shelves']
+        for shelf in page['shelves']:
+            assert not shelf.get('error'), 'Personal section failed: ' + shelf['id']
+            print('PASS: personal shelf', shelf['id'], len(shelf['items']), flush=True)
+        mixes = next(shelf for shelf in page['shelves'] if shelf['id'] == 'mixes')
+        opened = call(4, 'playlist.get', {'ref': mixes['items'][0]['ref']})
+        assert opened['tracks'], 'Personal playlist did not open'
+        assert all(t['ref'].startswith('track:mx:') or not t['available'] for t in opened['tracks'])
+        print('PASS: personal mix opened', len(opened['tracks']), flush=True)
+        library = call(5, 'library.list', {'kind': 'playlists', 'limit': 100})
+        assert library['items'], 'Expected account playlists'
+        opened = call(6, 'playlist.get', {'ref': library['items'][0]['ref']})
+        assert opened['tracks'], 'Library playlist did not open'
+        print('PASS: library playlist opened', len(opened['tracks']), flush=True)
+        playable = [t for t in opened['tracks'] if t.get('available', True)]
+        assert playable, 'No playable library tracks'
+        assert all(t.get('image') for t in playable), 'Missing playlist artwork'
+        print('PASS: playlist metadata', len(playable), 'playable;', len(opened['tracks'])-len(playable), 'unavailable;', sum(bool(t.get('quality')) for t in playable), 'quality labels', flush=True)
+        lyric = call(23, 'track.lyrics', {'ref': playable[0]['ref']})
+        assert lyric['status'] in ('found', 'none')
+        if lyric['status'] == 'found':
+            assert lyric['lyrics']['format'] == 'ttml' and '<tt' in lyric['lyrics']['text']
+        print('PASS: source lyrics', lyric['status'], flush=True)
+        document = call(21, 'page.get', {'ref': library['items'][0]['ref']})
+        assert document['header']['kind'] == 'playlist'
+        assert len(document['shelves'][0]['items']) == len(opened['tracks'])
+        album = next(item for shelf in page['shelves'] for item in shelf['items'] if item['kind'] == 'album')
+        document = call(22, 'page.get', {'ref': album['ref']})
+        assert document['header']['kind'] == 'album' and document['shelves'][0]['items']
+        print('PASS: playlist and album host page navigation', flush=True)
+        if '--features' in sys.argv:
+            assert all(t.get('album_ref') for t in playable), 'Missing album navigation'
+            assert any(t.get('artist_ref') for t in playable), 'Missing artist navigation'
+            found = call(30, 'search', {'text': 'The Cranberries'})
+            artists = found.get('artists', [])
+            artist = next((a for a in artists if a['title'].casefold() == 'the cranberries'), None)
+            assert artist, 'Missing exact artist match'
+            artist_page = call(31, 'page.get', {'ref': artist['ref']})
+            assert artist_page['header']['kind'] == 'artist'
+            assert artist_page.get('shelves'), 'Missing artist sections'
+            assert not artist_page['header'].get('collection_error'), 'Artist account state failed'
+            print('PASS: exact artist search and sections', len(artist_page['shelves']), flush=True)
+            assert not document['header'].get('collection_error'), 'Album account state failed: '+str(document['header'].get('collection_error', ''))
+            assert document['header'].get('library_supported'), 'Missing library action'
+            favorites = call(32, 'library.list', {'kind': 'tracks', 'limit': 500})
+            assert all(t.get('favorite') is True for t in favorites['items'])
+            print('PASS: favorite songs read', len(favorites['items']), 'of', favorites['total'], '; no account writes', flush=True)
+        resolved = call(7, 'track.resolve', {'ref': playable[0]['ref']})
+        assert resolved['format']['codec'] in ('alac', 'aac')
+        print('PASS: library track resolved; no audio output', flush=True)
+        child.stdin.close()
+        assert child.wait(timeout=15) == 0
+        print('PASS: packaged landing and clean shutdown; no playback', flush=True)
+    finally:
+        if child.poll() is None:
+            child.stdin.close()
+            try:
+                child.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()

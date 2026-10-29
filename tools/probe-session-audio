@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Exclusive saved-session smoke under host limits. No account output or DAC."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+root=Path(__file__).resolve().parents[1]
+if '--inside' not in sys.argv:
+    data=Path(os.environ['PLUGIN_DATA_DIR']).resolve()
+    command=['bwrap','--unshare-all','--share-net','--die-with-parent','--new-session','--cap-drop','ALL',
+             '--ro-bind','/usr','/usr','--symlink','usr/lib','/lib','--symlink','usr/lib64','/lib64',
+             '--symlink','usr/bin','/bin','--proc','/proc','--dev','/dev','--tmpfs','/tmp']
+    for item in ['ssl','ca-certificates','pki','resolv.conf','hosts','nsswitch.conf','ld.so.cache','ld.so.conf','ld.so.conf.d']:
+        command+=['--ro-bind-try','/etc/'+item,'/etc/'+item]
+    command+=['--ro-bind',str(root),'/plugin','--bind',str(data),'/data','--chdir','/data','--clearenv',
+              '--setenv','PATH','/usr/bin','--setenv','HOME','/data','--setenv','SSL_CERT_DIR','/etc/ssl/certs',
+              '--','/usr/bin/prlimit','--as=2147483648','--nofile=256','--core=0','--',
+              '/usr/bin/python3','/plugin/tools/probe-session-audio','--inside']
+    if '--mx' in sys.argv: command.append('--mx')
+    if '--regional' in sys.argv: command.append('--regional')
+    if '--control' in sys.argv: command.append('--control')
+    if '--debug' in sys.argv: command.append('--debug')
+    if '--trace' in sys.argv:
+        at=command.index('--')
+        command[at:at]=['--setenv','LD_PRELOAD','/plugin/build/abort-trace.so']
+    raise SystemExit(subprocess.run(command,env={},timeout=120).returncode)
+sys.path.insert(0,str(root/'src'))
+from apple_music_plugin.engine import Engine
+if '--debug' in sys.argv:
+    original_popen = subprocess.Popen
+    def debugging_popen(command, **kwargs):
+        kwargs['env'].pop('MUSICKIT_PARENT_PID', None)
+        kwargs['env']['DEBUGINFOD_URLS'] = ''
+        kwargs['stdout'] = subprocess.PIPE
+        kwargs['stderr'] = subprocess.STDOUT
+        return original_popen(['gdb','-nx','--batch','-iex','set debuginfod enabled off',
+          '-iex','set auto-load off','-iex','set auto-solib-add off',
+          '-ex','set print frame-arguments none','-ex','set print entry-values no',
+          '-ex','handle SIGURG nostop noprint pass','-ex','run','-ex','bt 20',
+          '--args']+command, **kwargs)
+    subprocess.Popen = debugging_popen
+    def frames(self, child):
+        for line in child.stdout:
+            if line.startswith(b'#'):
+                # GDB frame arguments are disabled; retain only symbol/location.
+                print('FRAME', line.decode(errors='replace').strip(), flush=True)
+        child.stdout.close()
+    Engine._diagnostics = frames
+if os.environ.get('LD_PRELOAD'):
+    def trace_frames(self, child):
+        import re
+        for line in child.stderr:
+            if re.fullmatch(rb'[^\s()]+\([^\n]*\) \[0x[0-9a-f]+\]\n',line):
+                print('FRAME',line.decode().strip(),flush=True)
+        child.stderr.close()
+    Engine._diagnostics = trace_frames
+engine=Engine('/data',root/'runtime')
+sessions=[]
+try:
+    engine.start()
+    for _ in range(120):
+        state=engine.request('GET','/drm/status').get('state',{})
+        if state.get('fairplay')=='ready':break
+        if state.get('manager')=='failed':raise RuntimeError('Saved session did not become ready')
+        time.sleep(.25)
+    else:raise RuntimeError('Saved session initialization timed out')
+    print('READY',flush=True)
+    print('REGION',engine.request('GET','/catalog/storefront'),flush=True)
+    meta=engine.request('GET','/metadata/1713861904?sf=us')
+    print('CATALOG',meta.get('title'),meta.get('artistName'),flush=True)
+    selected = None
+    if '--regional' in sys.argv:
+        found=engine.request('GET','/catalog/search?sf=mx&term=Iron+Maiden+Where+Eagles+Dare&limit=25')
+        selected=[row['id'] for row in found.get('results',{}).get('songs',{}).get('data',[]) if row.get('attributes',{}).get('artistName') == 'Iron Maiden'][:2]
+        first = next(row for row in found['results']['songs']['data'] if row.get('id') == selected[0])
+        from urllib.parse import urlsplit
+        album_id=urlsplit(first['attributes']['url']).path.rstrip('/').split('/')[-1]
+        if album_id.isdigit():
+            album=engine.request('GET','/catalog/albums/'+album_id+'?sf=mx')
+            selected=[row['id'] for row in album['data'][0]['relationships']['tracks']['data']][:2]
+        print('REGIONAL_IDS',selected,flush=True)
+    for asset in (selected if selected is not None else ['1441164421'] if '--control' in sys.argv else ['1713861904','1713861905']):
+        result=engine.request('POST','/playback',{'assetId':asset,'storefront':'mx' if '--mx' in sys.argv or '--regional' in sys.argv else 'us','capabilities':{'lossless':True,'atmos':False,'video':False}})
+        sessions.append(result['sessionId']);print('CREATED',asset,flush=True)
+    for sid in sessions:
+        c=engine.connect()
+        try:
+            c.request('HEAD','/api/v1/playback/'+sid+'/complete-audio',headers={'Authorization':'Bearer '+engine.token})
+            r=c.getresponse();r.read();print('AUDIO',r.status,r.getheader('Content-Length'),flush=True)
+            if r.status != 200: raise RuntimeError('Complete audio failed')
+            if '--regional' in sys.argv:
+                c.request('GET','/api/v1/playback/'+sid+'/complete-audio',headers={'Authorization':'Bearer '+engine.token})
+                r=c.getresponse()
+                if r.status != 200: raise RuntimeError('Audio body failed')
+                decoder=subprocess.Popen(['ffmpeg','-v','error','-xerror','-i','pipe:0','-f','null','-'],stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                try:
+                    while chunk:=r.read(65536): decoder.stdin.write(chunk)
+                    decoder.stdin.close()
+                    if decoder.wait(timeout=30)!=0: raise RuntimeError('Audio decoding failed')
+                    print('DECODED_FULL_TRACK',flush=True)
+                finally:
+                    if decoder.poll() is None: decoder.kill();decoder.wait()
+        finally:c.close()
+    print("DIAGNOSTIC",json.dumps(engine.diagnostic),flush=True)
+    print("ENGINE_ALIVE", engine.child.poll() is None, flush=True)
+except Exception as error:
+    print('FAILED',type(error).__name__, getattr(error, 'data', None),flush=True)
+    message = (getattr(engine,'customer_message',None) or '').lower()
+    import re
+    safe_message = re.sub(r'https?://\S+|[\w.+-]+@[\w.-]+|[0-9]{6,}', '[redacted]', message)
+    print('CUSTOMER_MESSAGE',safe_message[:400],flush=True)
+    print('CUSTOMER_CATEGORIES',[word for word in ['country','region','store','subscription','sign in','unavailable','computer','device','authorize','purchase','cuenta','país','región','tienda'] if word in message],flush=True)
+    time.sleep(.7)
+    print('DIAGNOSTIC',json.dumps(engine.diagnostic),flush=True)
+finally:
+    if engine.child and engine.child.poll() is None:
+        for sid in sessions:
+            try:engine.request('DELETE','/playback/'+sid)
+            except Exception:pass
+    engine.close()

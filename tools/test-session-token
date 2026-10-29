@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+"""Verify the production session writer flushes and replaces token data."""
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+source = (Path(sys.argv[1])/'drm/native/main.c').read_text()
+a = source.index('void write_music_token(void) {')
+b = source.index('\n}', a)+2
+fixture = r'''
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+static struct { char *base_dir_arg; } args_info;
+static char *g_music_token;
+static char *strcat_b(const char *a, const char *b) {
+    char *result = malloc(strlen(a)+strlen(b)+1);
+    strcpy(result,a); strcat(result,b); return result;
+}
+''' + source[a:b] + r'''
+static void verify(const char *expected) {
+    char *path = strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN");
+    FILE *file = fopen(path,"r"); free(path); assert(file);
+    char data[128] = {0};
+    size_t count = fread(data,1,sizeof(data)-1,file); fclose(file);
+    assert(count == strlen(expected));
+    assert(strcmp(data,expected) == 0);
+}
+int main(int argc, char **argv) {
+    assert(argc == 2); args_info.base_dir_arg = argv[1];
+    g_music_token = "fixture-first-token"; write_music_token(); verify(g_music_token);
+    g_music_token = "rotated"; write_music_token(); verify(g_music_token);
+    return 0;
+}
+'''
+with tempfile.TemporaryDirectory(prefix='plugin-session-writer-') as tmp:
+    c, exe = Path(tmp)/'test.c', Path(tmp)/'test'
+    c.write_text(fixture)
+    subprocess.run(['cc','-Wall','-Wextra','-Werror',str(c),'-o',str(exe)],check=True)
+    subprocess.run([str(exe),tmp],check=True)
+print('PASS: production session writer flushes immediately and replaces rotated tokens')

@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""Resolve one diagnostic session and release it without fetching audio; print fixed categories only."""
+import http.client
+import json
+import os
+from pathlib import Path
+import ssl
+import sys
+
+# Read only the plugin engine's private API transport credentials into memory.
+# Never inspect account files, print environment values or dump API responses.
+for process in Path('/proc').iterdir():
+    if not process.name.isdigit():
+        continue
+    try:
+        if process.stat().st_uid != os.getuid():
+            continue
+        command = (process/'cmdline').read_bytes().split(b'\0')
+        if not command or not command[0].endswith(b'/musickit-engine') or b'--api' not in command:
+            continue
+        namespace = process/'root'
+        manifest = json.loads((namespace/'plugin/manifest.json').read_text())
+        if manifest.get('id') != 'io.github.shinnycharizard.apple-music':
+            continue
+        environment = dict(part.split(b'=', 1) for part in (process/'environ').read_bytes().split(b'\0') if b'=' in part)
+        token = environment[b'MUSICKIT_API_TOKEN'].decode()
+        certificate = namespace/os.fsdecode(environment[b'MUSICKIT_CERT_FILE']).lstrip('/')
+        context = ssl.create_default_context(cafile=str(certificate))
+        port = int(command[command.index(b'--api')+1])
+        break
+    except (OSError, ValueError, KeyError):
+        continue
+else:
+    raise SystemExit('No running installed plugin engine found')
+
+import re
+asset = sys.argv[1]
+if not re.fullmatch(r"[0-9]{1,24}", asset):
+    raise SystemExit("Invalid track ID")
+connection = http.client.HTTPSConnection('127.0.0.1', port, context=context, timeout=30)
+try:
+    connection.request('POST', '/api/v1/playback', body=json.dumps({'assetId':asset,'storefront':'mx','capabilities':{'lossless':True,'atmos':False,'video':False}}), headers={'Authorization':'Bearer '+token,'Content-Type':'application/json'})
+    response = connection.getresponse()
+    raw = response.read(65536)
+    report = {'status':response.status, 'asset':asset}
+    if response.status == 200:
+        result=json.loads(raw)
+        report['codec']=result.get('codec')
+        session=result.get('sessionId','')
+        if re.fullmatch(r'[A-Za-z0-9_-]{1,128}',session):
+            connection.request('DELETE','/api/v1/playback/'+session,headers={'Authorization':'Bearer '+token})
+            closed=connection.getresponse();closed.read();report['test_session_closed']=closed.status in (200,204)
+    else:
+        message=raw.decode(errors='replace')
+        report['categories']=[name for marker,name in [
+            ('no HLS URL','hls_missing'),('no HLS variant','variant_missing'),
+            ('webplayback AAC asset','aac_asset'),('webplayback response contained no song list','song_list_missing'),
+            ('no asset with flavor','aac_flavor_missing'),('not found in','catalog_missing'),
+            ('circuit open','circuit_open'),('requires CBCS','cbcs_missing'),
+            ('open media playlist','media_playlist'),('acquire licence','licence'),
+            ('open audio stream','audio_open'),('PSSH','pssh'),('widevine','widevine'),
+            ('decrypt','decrypt'),('initialization','initialization'),('no tracks','no_tracks')]
+            if marker in message]
+        report['upstream_http']=re.findall(r'HTTP ([1-5][0-9]{2})',message)
+    print(json.dumps(report))
+finally:
+    connection.close()

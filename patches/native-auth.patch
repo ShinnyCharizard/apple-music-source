@@ -1,0 +1,1349 @@
+diff --git a/drm/Makefile b/drm/Makefile
+index e47c5fb..b8d1ff5 100644
+--- a/drm/Makefile
++++ b/drm/Makefile
+@@ -10,7 +10,7 @@ AS = as
+ CFLAGS = -Wall -Wextra -Werror -pedantic -std=c11 -fPIC -O2 -g -fno-stack-protector -Wno-format-truncation
+ # drm_hybris.c uses setjmp/longjmp for SIGSEGV probing — clobbered-by-longjmp is expected
+ HYBRIS_CFLAGS = $(CFLAGS) -Wno-clobbered -Wno-maybe-uninitialized -Wno-pedantic
+-LDFLAGS_LIB = -shared -lpthread -lcrypto -lssl -ldl -lm -lstdc++ -Wl,--no-as-needed -lcurl -Wl,--as-needed -Wl,-z,relro,-z,now
++LDFLAGS_LIB = -shared -lpthread -lcrypto -lssl -ldl -lm -lstdc++ -Wl,--no-as-needed -lcurl -Wl,--as-needed -Wl,-z,relro,-z,now,-z,noexecstack
+ LDFLAGS_TEST = -lpthread -lcrypto -lssl -fno-stack-protector
+ 
+ # libhybris-core.so (vendored, see vendor/libhybris/README.md) is embedded into libdrm_client.so;
+diff --git a/drm/drm_client.c b/drm/drm_client.c
+index 27beb9d..501c3ec 100644
+--- a/drm/drm_client.c
++++ b/drm/drm_client.c
+@@ -73,267 +73,6 @@ static struct drm_module_state g_state = {
+     .recovery_active = 0,
+ };
+ 
+-/* ── File System Helper Functions (REQ-10.1) ───────────────────────────────*/
+-
+-static const char *MPL_DB_DIR = "mpl_db";
+-
+-static char *get_mpl_db_path(const char *filename)
+-{
+-    if (!g_state.base_directory || !filename) {
+-        return NULL;
+-    }
+-    
+-    size_t base_len = strlen(g_state.base_directory);
+-    size_t mpl_len = strlen(MPL_DB_DIR);
+-    size_t file_len = strlen(filename);
+-    
+-    char *path = malloc(base_len + 1 + mpl_len + 1 + file_len + 1);
+-    if (!path) {
+-        return NULL;
+-    }
+-    
+-    snprintf(path, base_len + mpl_len + file_len + 3,
+-             "%s/%s/%s", g_state.base_directory, MPL_DB_DIR, filename);
+-    return path;
+-}
+-
+-static int ensure_mpl_db_dir(void)
+-{
+-    if (!g_state.base_directory) {
+-        return -1;
+-    }
+-
+-    /* First ensure base directory exists */
+-    struct stat st;
+-    if (stat(g_state.base_directory, &st) != 0) {
+-        if (mkdir(g_state.base_directory, 0700) != 0 && errno != EEXIST) {
+-            return -1;
+-        }
+-    }
+-    
+-    char *dir_path = malloc(strlen(g_state.base_directory) + strlen(MPL_DB_DIR) + 2);
+-    if (!dir_path) {
+-        return -1;
+-    }
+-    
+-    snprintf(dir_path, strlen(g_state.base_directory) + strlen(MPL_DB_DIR) + 2,
+-             "%s/%s", g_state.base_directory, MPL_DB_DIR);
+-    
+-    int result = mkdir(dir_path, 0700);
+-    free(dir_path);
+-    
+-    return (result == 0 || errno == EEXIST) ? 0 : -1;
+-}
+-
+-static int save_token(const char *filename, const char *content)
+-{
+-    if (!filename || !content) {
+-        return -1;
+-    }
+-
+-    char *path = get_mpl_db_path(filename);
+-    if (!path) {
+-        return -1;
+-    }
+-
+-    size_t tmp_len = strlen(path) + 5;
+-    char *tmp_path = malloc(tmp_len);
+-    if (!tmp_path) {
+-        free(path);
+-        return -1;
+-    }
+-    snprintf(tmp_path, tmp_len, "%s.tmp", path);
+-
+-    FILE *f = fopen(tmp_path, "w");
+-    if (!f) {
+-        free(tmp_path);
+-        free(path);
+-        return -1;
+-    }
+-
+-    int result = fprintf(f, "%s", content) > 0 ? 0 : -1;
+-    fclose(f);
+-
+-    if (result == 0) {
+-        result = (rename(tmp_path, path) == 0) ? 0 : -1;
+-    }
+-    if (result != 0) {
+-        unlink(tmp_path);
+-    }
+-
+-    free(tmp_path);
+-    free(path);
+-    return result;
+-}
+-
+-static char *load_token(const char *filename)
+-{
+-    if (!filename) {
+-        return NULL;
+-    }
+-    
+-    char *path = get_mpl_db_path(filename);
+-    if (!path) {
+-        return NULL;
+-    }
+-    
+-    FILE *f = fopen(path, "r");
+-    free(path);
+-    
+-    if (!f) {
+-        return NULL;
+-    }
+-    
+-    fseek(f, 0, SEEK_END);
+-    long size = ftell(f);
+-    fseek(f, 0, SEEK_SET);
+-    
+-    if (size <= 0 || size > 65536) {
+-        fclose(f);
+-        return NULL;
+-    }
+-    
+-    char *content = malloc(size + 1);
+-    if (!content) {
+-        fclose(f);
+-        return NULL;
+-    }
+-    
+-    size_t read_size = fread(content, 1, size, f);
+-    content[read_size] = '\0';
+-    fclose(f);
+-    
+-    return content;
+-}
+-
+-/* Load file from arbitrary path (for credential files in base_directory) */
+-static char *load_file(const char *filepath)
+-{
+-    if (!filepath) {
+-        return NULL;
+-    }
+-    
+-    FILE *f = fopen(filepath, "r");
+-    if (!f) {
+-        return NULL;
+-    }
+-    
+-    fseek(f, 0, SEEK_END);
+-    long size = ftell(f);
+-    fseek(f, 0, SEEK_SET);
+-    
+-    if (size <= 0 || size > 1024 * 1024) {  /* Max 1MB */
+-        fclose(f);
+-        return NULL;
+-    }
+-    
+-    char *content = malloc(size + 1);
+-    if (!content) {
+-        fclose(f);
+-        return NULL;
+-    }
+-    
+-    size_t read_size = fread(content, 1, size, f);
+-    content[read_size] = '\0';
+-    fclose(f);
+-    
+-    /* Remove trailing newline if present */
+-    while (read_size > 0 && (content[read_size-1] == '\n' || content[read_size-1] == '\r')) {
+-        content[--read_size] = '\0';
+-    }
+-    
+-    return content;
+-}
+-
+-static int is_placeholder_token(const char *tok)
+-{
+-    if (!tok) return 1;
+-    return (strcmp(tok, "derived_from_session") == 0 ||
+-            strcmp(tok, "placeholder_dev_token_base64") == 0 ||
+-            strcmp(tok, "placeholder_music_token_base64") == 0);
+-}
+-
+-static void save_account_tokens(void)
+-{
+-    if (ensure_mpl_db_dir() != 0) {
+-        return;
+-    }
+-
+-    if (g_state.storefront_id && !is_placeholder_token(g_state.storefront_id)) {
+-        save_token("storefront_id", g_state.storefront_id);
+-    }
+-    /* Never persist placeholder dev_token — it's synthesised at load time */
+-    if (g_state.dev_token && !is_placeholder_token(g_state.dev_token)) {
+-        save_token("dev_token", g_state.dev_token);
+-    }
+-    if (g_state.music_token && !is_placeholder_token(g_state.music_token)) {
+-        save_token("music_token", g_state.music_token);
+-    }
+-}
+-
+-static int load_account_tokens(void)
+-{
+-    char *token;
+-
+-    /* First try to load from clean-room token files */
+-    token = load_token("storefront_id");
+-    if (token) {
+-        free(g_state.storefront_id);
+-        g_state.storefront_id = token;
+-    }
+-
+-    token = load_token("dev_token");
+-    if (token) {
+-        free(g_state.dev_token);
+-        g_state.dev_token = token;
+-    }
+-
+-    token = load_token("music_token");
+-    if (token) {
+-        free(g_state.music_token);
+-        g_state.music_token = token;
+-    }
+-    
+-    /* If we have music_token + storefront_id from clean-room cache, done */
+-    if (g_state.music_token && g_state.storefront_id) {
+-        return 0;
+-    }
+-    
+-    /* Try to load from original Apple Music credential files */
+-    if (g_state.base_directory) {
+-        char *cred_path = malloc(strlen(g_state.base_directory) + 32);
+-        if (cred_path) {
+-            /* Load MUSIC_TOKEN */
+-            snprintf(cred_path, strlen(g_state.base_directory) + 32,
+-                     "%s/MUSIC_TOKEN", g_state.base_directory);
+-            token = load_file(cred_path);
+-            if (token && !g_state.music_token) {
+-                g_state.music_token = token;
+-            } else {
+-                free(token);
+-            }
+-
+-            /* Load STOREFRONT_ID */
+-            snprintf(cred_path, strlen(g_state.base_directory) + 32,
+-                     "%s/STOREFRONT_ID", g_state.base_directory);
+-            token = load_file(cred_path);
+-            if (token && !g_state.storefront_id) {
+-                g_state.storefront_id = token;
+-            } else {
+-                free(token);
+-            }
+-            
+-            /* dev_token is derived from the FairPlay session — not stored in
+-             * Apple's credential files and not needed for key-delivery calls. */
+-            
+-            free(cred_path);
+-        }
+-    }
+-    
+-    /* Minimum viable: music_token + storefront_id suffice for playback */
+-    return (g_state.music_token && g_state.storefront_id) ? 0 : -1;
+-}
+-
+ /* ── Performance Timing Helpers (REQ-11.1) ──────────────────────────────────*/
+ 
+ double drm_get_time_seconds(void)
+@@ -767,64 +506,27 @@ int drm_init(const struct drm_config *config)
+     /* Notify state transition */
+     call_state_callback(DRM_STATE_STARTING);
+     
+-    /* Try to load cached tokens first (REQ-10.1) */
+-    int has_cached_tokens = (load_account_tokens() == 0);
+-    
+-    /* Debug: print loaded tokens */
+-    fprintf(stderr, "[drm] drm_init: has_cached_tokens=%d\n", has_cached_tokens);
+-    fprintf(stderr, "[drm] drm_init: storefront_id=%s\n", g_state.storefront_id ? g_state.storefront_id : "NULL");
+-    fprintf(stderr, "[drm] drm_init: dev_token=%s\n", g_state.dev_token ? (strlen(g_state.dev_token) > 0 ? "SET" : "EMPTY") : "NULL");
+-    fprintf(stderr, "[drm] drm_init: music_token=%s\n", g_state.music_token ? (strlen(g_state.music_token) > 0 ? "SET" : "EMPTY") : "NULL");
+-    
+-    /* Simulate login if credentials provided (REQ-5.1) */
+-    if (config->username && config->password) {
+-        call_state_callback(DRM_STATE_LOGIN);
+-        
+-        /* Check if 2FA is needed (REQ-5.1) */
+-        char auth_buffer[DRM_AUTH_BUFFER_SIZE];
+-        memset(auth_buffer, 0, sizeof(auth_buffer));
+-        
+-        /* Simulate 2FA challenge */
+-        /* In real impl, this would check server response */
+-        if (0) {  /* Placeholder for 2FA detection */
+-            call_state_callback(DRM_STATE_WAITING_2FA);
+-            if (!call_auth_callback(DRM_CHALLENGE_2FA, auth_buffer, sizeof(auth_buffer))) {
+-                call_state_callback(DRM_STATE_FAILED);
+-                return -1;
+-            }
+-        }
+-        
+-        /* Fresh login: set new tokens */
+-        g_state.storefront_id = strdup("US");
+-        g_state.dev_token = strdup("placeholder_dev_token_base64");
+-        g_state.music_token = strdup("placeholder_music_token_base64");
+-    } else if (!has_cached_tokens) {
+-        /* No credentials and no cached tokens */
+-        call_state_callback(DRM_STATE_FAILED);
+-        return -1;
+-    }
+-    /* else: using cached tokens, already loaded above */
+-    
+-    /* Simulate FairPlay initialization */
+-    call_state_callback(DRM_STATE_INITIALIZING_FAIRPLAY);
+-    
+-    /* Placeholder implementation: In production, this would:
+-     * - Load Android libraries via libhybris (optional)
+-     * - Create request context with device configuration
+-     * - Authenticate if credentials provided
+-     * - Acquire playback lease from Apple servers
+-     * - Initialize FairPlay session */
+-    
++    /* Authentication and account tokens come only from drm_lib_init. */
+     g_state.initialized = 1;
+-    
+-    /* Save tokens to file system (REQ-10.1) */
+-    save_account_tokens();
+-    
+-    call_state_callback(DRM_STATE_RUNNING);
+-    
++    call_state_callback(DRM_STATE_LOGIN);
++
+     return 0;
+ }
+ 
++/* Forward the wrapper callbacks registered by the Go coordinator. */
++void drm_forward_auth(const char *type, char *buf, int size, void *ud)
++{
++    (void)ud;
++    if (size > 0) memset(buf, 0, (size_t)size);
++    call_auth_callback(type, buf, size);
++}
++
++void drm_forward_state(const char *state, void *ud)
++{
++    (void)ud;
++    call_state_callback(state);
++}
++
+ /* ── drm_shutdown (REQ-4.2) ─────────────────────────────────────────────────*/
+ 
+ void drm_shutdown(void)
+@@ -2884,8 +2586,9 @@ int drm_device_guid_get(char *out_guid, size_t buf_size)
+     /* adi.pb is a protobuf, but we'll store GUID as first 36 bytes for simplicity */
+     FILE *f = fopen(adi_path, "rb");
+     if (f) {
+-        fread(out_guid, 1, 36, f);
++        size_t count = fread(out_guid, 1, 36, f);
+         fclose(f);
++        if (count != 36) return generate_uuid(out_guid, buf_size);
+         if (out_guid[0] && out_guid[8] == '-' && out_guid[13] == '-' &&
+             out_guid[18] == '-' && out_guid[23] == '-') {
+             out_guid[36] = '\0';
+diff --git a/drm/drm_hybris.c b/drm/drm_hybris.c
+index fa0c4ab..e8d2354 100644
+--- a/drm/drm_hybris.c
++++ b/drm/drm_hybris.c
+@@ -303,11 +303,8 @@ int hybris_backend_init(
+ extern int   mk_lib_init_guarded(const drm_lib_config_t *cfg);
+ extern void *mk_open_kd_ctx_guarded(const char *adam, const char *uri);
+ 
+-static void wrapper_state_cb(const char *state, void *ud)
+-{
+-    (void)ud;
+-    fprintf(stderr, "[hybris] wrapper state: %s\n", state);
+-}
++extern void drm_forward_auth(const char *, char *, int, void *);
++extern void drm_forward_state(const char *, void *);
+ 
+ int hybris_fairplay_init(const char *base_dir, const char *device_info,
+                          const char *lib64_dir, const char *username, const char *password)
+@@ -324,7 +321,8 @@ int hybris_fairplay_init(const char *base_dir, const char *device_info,
+      * own account database is empty until it has logged in. */
+     cfg.username    = username;
+     cfg.password    = password;
+-    cfg.state_cb    = wrapper_state_cb;
++    cfg.state_cb    = drm_forward_state;
++    cfg.auth_cb     = drm_forward_auth;
+ 
+     int rc = mk_lib_init_guarded(&cfg);
+     if (rc == 0) g_hybris.fairplay_inited = 1;
+@@ -558,20 +556,17 @@ void hybris_corefp_probe(void)
+ 
+ /* ── Shutdown ────────────────────────────────────────────────────────────────*/
+ 
++extern void drm_lib_shutdown(void);
++
+ void hybris_backend_shutdown(void)
+ {
+     pthread_mutex_lock(&g_hybris.lock);
+     if (!g_hybris.initialized) { pthread_mutex_unlock(&g_hybris.lock); return; }
+ 
+-    if (g_hybris.appmusic_handle && g_hybris.android_dlclose)
+-        g_hybris.android_dlclose(g_hybris.appmusic_handle);
+-    if (g_hybris.corefp_handle && g_hybris.android_dlclose)
+-        g_hybris.android_dlclose(g_hybris.corefp_handle);
+-
+-    embedded_loader_shutdown();
+-
+-    memset(&g_hybris, 0, sizeof(g_hybris));
+-    pthread_mutex_init(&g_hybris.lock, NULL);
++    drm_lib_shutdown();
++    /* Native timers can retain code pointers. I keep libraries mapped until
++     * this plugin-owned process exits instead of invalidating those pointers. */
++    g_hybris.fairplay_inited = 0;
+     pthread_mutex_unlock(&g_hybris.lock);
+ }
+ 
+diff --git a/drm/native/drm_lib.c b/drm/native/drm_lib.c
+index 517804a..29febb7 100644
+--- a/drm/native/drm_lib.c
++++ b/drm/native/drm_lib.c
+@@ -52,6 +52,7 @@ extern void          *g_drm_state_ud;
+ /* init/codec helpers in main.c / hybris_stubs.c */
+ extern void hybris_init_callbacks(void);
+ extern void start_recovery_thread(void);
++extern void stop_recovery_thread(void);
+ extern int hybris_init_libs(const char *lib64_path);
+ 
+ /* account helpers */
+@@ -111,7 +112,7 @@ int drm_lib_init(const drm_lib_config_t *cfg)
+     /* Synthesise a fake args_info from cfg so the rest of main.c still works */
+     memset(&args_info, 0, sizeof(args_info));
+     if (cfg->base_dir) {
+-        args_info.base_dir_arg = (char *)cfg->base_dir;
++        args_info.base_dir_arg = strdup(cfg->base_dir);
+         args_info.base_dir_given = 1;
+     }
+     {
+@@ -119,7 +120,7 @@ int drm_lib_init(const drm_lib_config_t *cfg)
+         const char *di = (cfg->device_info && cfg->device_info[0])
+             ? cfg->device_info
+             : "Music/4.9/Android/10/Samsung S9/7663313/en-US/en-US/dc28071e981c439e";
+-        args_info.device_info_arg = (char *)di;
++        args_info.device_info_arg = strdup(di);
+         args_info.device_info_given = (cfg->device_info && cfg->device_info[0]) ? 1 : 0;
+         /* split device_infos just like main() does */
+         static char *di_copy = NULL;
+@@ -135,9 +136,13 @@ int drm_lib_init(const drm_lib_config_t *cfg)
+ 
+     /* Credentials for fresh login */
+     if (cfg->username && cfg->password) {
+-        amUsername = (char *)cfg->username;
++        amUsername = strdup(cfg->username);
+         /* Allocate a mutable buffer (credentialHandler appends the 2FA code) */
+-        static char pw_buf[256];
++        static char pw_buf[519];
++        if (strlen(cfg->password) > 512) {
++            pthread_mutex_unlock(&g_init_mutex);
++            return -1;
++        }
+         strncpy(pw_buf, cfg->password, sizeof(pw_buf) - 1);
+         pw_buf[sizeof(pw_buf) - 1] = '\0';
+         amPassword = pw_buf;
+@@ -193,7 +198,7 @@ int drm_lib_init(const drm_lib_config_t *cfg)
+ 
+     /* Cache account tokens */
+     g_storefront_id = get_account_storefront_id(reqCtx);
+-    if (!g_storefront_id) {
++    if (!g_storefront_id || !g_storefront_id[0]) {
+         fprintf(stderr, "[drm_lib] failed to get storefront ID\n");
+         g_init_result = -1;
+         pthread_mutex_unlock(&g_init_mutex);
+@@ -237,6 +242,7 @@ int drm_lib_init(const drm_lib_config_t *cfg)
+ 
+ void drm_lib_shutdown(void)
+ {
++    stop_recovery_thread();
+     /* No clean shutdown API in the underlying library — just reset callbacks
+      * so no further callbacks fire after the Go engine destroys its context. */
+     pthread_mutex_lock(&g_init_mutex);
+@@ -249,11 +255,8 @@ void drm_lib_shutdown(void)
+ 
+ char *drm_lib_get_m3u8(unsigned long adam_id)
+ {
+-    const char *url;
+-    if (offlineFlag)
+-        url = get_m3u8_method_download(reqCtx, adam_id, NULL);
+-    else
+-        url = get_m3u8_method_play(leaseMgr, adam_id, NULL);
++    /* This integration requests streaming playback only. */
++    const char *url = get_m3u8_method_play(leaseMgr, adam_id, NULL);
+ 
+     if (!url)
+         return NULL;
+diff --git a/drm/native/hybris_stubs.c b/drm/native/hybris_stubs.c
+index 662ad6c..e89ec6f 100644
+--- a/drm/native/hybris_stubs.c
++++ b/drm/native/hybris_stubs.c
+@@ -20,6 +20,7 @@ extern const char *android_dlerror(void);
+ #define RTLD_NOW_GLOBAL 0x102
+ 
+ static void *h_ssc = NULL;  /* libstoreservicescore.so */
++static int (*plugin_guard_call)(void*, void**, int*, int*) = NULL;
+ static void *h_apm = NULL;  /* libandroidappmusic.so   */
+ 
+ /* ── vtable data arrays ──────────────────────────────────────────────────────
+@@ -69,6 +70,12 @@ int hybris_init_libs(const char *lib64) {
+     h_apm = android_dlopen(path, RTLD_NOW_GLOBAL);
+     if (!h_apm) { fprintf(stderr, "[hybris] cannot load libandroidappmusic.so: %s\n", android_dlerror()); return -1; }
+ 
++    snprintf(path, sizeof(path), "%s/libplugin_guard.so", lib64);
++    void *guard = android_dlopen(path, RTLD_NOW_GLOBAL);
++    if (!guard) { fprintf(stderr, "[hybris] guest exception guard unavailable\n"); return -1; }
++    plugin_guard_call = android_dlsym(guard, "plugin_guard_call");
++    if (!plugin_guard_call) return -1;
++
+     /* copy vtable content into our local arrays so &_ZTV... + 2 == vtable[2] */
+ #define PATCHV(arr, sym_name) do { \
+     void *p = android_dlsym(h_ssc, sym_name); \
+@@ -369,7 +376,13 @@ void _ZN21SVFootHillSessionCtrl16getPersistentKeyERKNSt6__ndk112basic_stringIcNS
+                       union std_string*,union std_string*,union std_string*,union std_string*,
+                       union std_string*,union std_string*,union std_string*,union std_string*) = NULL;
+     if (!fn) fn = sym("_ZN21SVFootHillSessionCtrl16getPersistentKeyERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEES8_S8_S8_S8_S8_S8_S8_");
+-    fn(ret,obj,a,b,c,d,e,f,g,h);
++    void *args[] = {ret,obj,a,b,c,d,e,f,g,h};
++    int code = 0, component = 0;
++    if (plugin_guard_call((void*)fn, args, &code, &component)) {
++        ret->obj = NULL;
++        ret->ctrl_blk = NULL;
++        fprintf(stderr, "[plugin-key] rejected code=%d component=%d\n", code, component);
++    }
+ }
+ 
+ void _ZN21SVFootHillSessionCtrl14decryptContextERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEERKN11SVDecryptor15SVDecryptorTypeERKb(
+@@ -546,7 +559,14 @@ struct shared_ptr *_ZN22SVPlaybackLeaseManager12requestAssetERKmRKNSt6__ndk16vec
+     void *obj, void *unused, unsigned long *adamId, struct std_vector *flavors, uint8_t *offline) {
+     static struct shared_ptr *(*fn)(void*,void*,unsigned long*,struct std_vector*,uint8_t*) = NULL;
+     if (!fn) fn = sym("_ZN22SVPlaybackLeaseManager12requestAssetERKmRKNSt6__ndk16vectorINS2_12basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEENS7_IS9_EEEERKb");
+-    return fn(obj,unused,adamId,flavors,offline);
++    void *args[] = {obj,unused,adamId,flavors,offline,NULL,NULL,NULL,NULL,NULL};
++    int code = 0, component = 0;
++    if (plugin_guard_call((void*)fn, args, &code, &component)) {
++        struct shared_ptr *ret = obj;
++        ret->obj = NULL; ret->ctrl_blk = NULL;
++        fprintf(stderr, "[plugin-key] rejected code=%d component=%d\n", code, component);
++    }
++    return obj;
+ }
+ 
+ int _ZNK23SVPlaybackAssetResponse13hasValidAssetEv(void *obj) {
+@@ -560,8 +580,13 @@ struct shared_ptr *_ZNK23SVPlaybackAssetResponse13playbackAssetEv(void *obj) {
+     return fn(obj);
+ }
+ int _ZNK23SVPlaybackAssetResponse9errorCodeEv(void *obj) {
+-    static int (*fn)(void*) = NULL;
++    static const int *(*fn)(void*) = NULL;
+     if (!fn) fn = sym("_ZNK23SVPlaybackAssetResponse9errorCodeEv");
++    return *fn(obj);
++}
++union std_string *plugin_asset_error_message(void *obj) {
++    static union std_string *(*fn)(void*) = NULL;
++    if (!fn) fn = sym("_ZNK23SVPlaybackAssetResponse12errorMessageEv");
+     return fn(obj);
+ }
+ union std_string *_ZNK23SVPlaybackAssetResponse12errorMessageEv(void *obj, void *out) {
+@@ -742,9 +767,18 @@ union std_string *_ZNK17storeservicescore13PurchaseAsset11downloadKeyEv(void *ob
+     return fn(obj,out);
+ }
+ int _ZNK17storeservicescore19StoreErrorCondition9errorCodeEv(void *obj) {
+-    static int (*fn)(void*) = NULL;
++    /* The Android ABI returns const int&, not an integer value. */
++    static const int *(*fn)(void*) = NULL;
+     if (!fn) fn = sym("_ZNK17storeservicescore19StoreErrorCondition9errorCodeEv");
+-    return fn(obj);
++    const int *code = fn(obj);
++    return code ? *code : 0;
++}
++long plugin_external_auth_error(void *obj) {
++    /* Android getter returns const long& on the pinned x86_64 ABI. */
++    static const long *(*fn)(void*) = NULL;
++    if (!fn) fn = sym("_ZNK17storeservicescore19StoreErrorCondition17externalErrorCodeEv");
++    const long *code = fn(obj);
++    return code ? *code : 0;
+ }
+ const char *_ZNK17storeservicescore19StoreErrorCondition4whatEv(void *obj) {
+     static const char *(*fn)(void*) = NULL;
+diff --git a/drm/native/main.c b/drm/native/main.c
+index 06441f3..d939dd1 100644
+--- a/drm/native/main.c
++++ b/drm/native/main.c
+@@ -1,3 +1,4 @@
++#include "music_token_request.h"
+ /*
+  * main.c — Apple Music FairPlay 解密 wrapper 的 Android 层主程序
+  * (运行在 rootfs chroot 内, legacy: launched by wrapper.c / wrapper-rootless.c; now linked in-process)
+@@ -202,6 +203,9 @@ int split_string_safe(const char *str, const char *delim, char **components,
+     return count;
+ }
+ 
++extern long plugin_external_auth_error(void *obj);
++extern union std_string *plugin_asset_error_message(void *obj);
++
+ static void dialogHandler(long j, struct shared_ptr *protoDialogPtr,
+                           struct shared_ptr *respHandler) {
+     const char *const title = std_string_data(
+@@ -210,6 +214,11 @@ static void dialogHandler(long j, struct shared_ptr *protoDialogPtr,
+             std_string_data(_ZNK17storeservicescore14ProtocolDialog7messageEv(
+                 protoDialogPtr->obj)));
+ 
++    const char *customer_message = std_string_data(
++        _ZNK17storeservicescore14ProtocolDialog7messageEv(protoDialogPtr->obj));
++    if (customer_message && *customer_message)
++        fprintf(stderr, "[plugin-auth] dialog_message: %s\n", customer_message);
++
+     unsigned char ptr[72];
+     memset(ptr + 8, 0, 16);
+     *(void **)(ptr) =
+@@ -220,6 +229,7 @@ static void dialogHandler(long j, struct shared_ptr *protoDialogPtr,
+ 
+     struct std_vector *butVec =
+         _ZNK17storeservicescore14ProtocolDialog7buttonsEv(protoDialogPtr->obj);
++    int selected = 0;
+     if (strcmp("Sign In", title) == 0) {
+         for (struct shared_ptr *b = butVec->begin; b != butVec->end; ++b) {
+             if (strcmp("Use Existing Apple ID",
+@@ -228,6 +238,7 @@ static void dialogHandler(long j, struct shared_ptr *protoDialogPtr,
+                                b->obj))) == 0) {
+                 _ZN17storeservicescore22ProtocolDialogResponse17setSelectedButtonERKNSt6__ndk110shared_ptrINS_14ProtocolButtonEEE(
+                     diagResp.obj, b);
++                selected = 1;
+                 break;
+             }
+         }
+@@ -239,6 +250,7 @@ static void dialogHandler(long j, struct shared_ptr *protoDialogPtr,
+                     _ZNK17storeservicescore14ProtocolButton5titleEv(b->obj)));
+         }
+     }
++    fprintf(stderr, "[plugin-auth] dialog=%s\n", selected ? "existing_account" : "unsupported");
+     _ZN20androidstoreservices28AndroidPresentationInterface28handleProtocolDialogResponseERKlRKNSt6__ndk110shared_ptrIN17storeservicescore22ProtocolDialogResponseEEE(
+         apInf.obj, &j, &diagResp);
+ }
+@@ -256,6 +268,11 @@ static void credentialHandler(struct shared_ptr *credReqHandler,
+             credReqHandler->obj)),
+         need2FA ? "true" : "false");
+ 
++    if (!amUsername || !amPassword) {
++        write_drm_state("FAILED");
++        _exit(1); /* Session reuse now requires an explicit fresh login. */
++    }
++    fprintf(stderr, "[plugin-auth] credentials=%s\n", need2FA ? "challenge" : "password");
+     int passLen = strlen(amPassword);
+ 
+     if (need2FA) {
+@@ -264,6 +281,11 @@ static void credentialHandler(struct shared_ptr *credReqHandler,
+             /* library mode: ask the Go engine for the 2FA code */
+             char code[16] = {0};
+             g_drm_auth_cb("2fa", code, sizeof(code), g_drm_auth_ud);
++            /* An invalid/cancelled reply must not retry the bare password. */
++            if (strlen(code) != 6 || strspn(code, "0123456789") != 6) {
++                write_drm_state("FAILED");
++                _exit(1);
++            }
+             strncat(amPassword, code, 6);
+         } else if (args_info.code_from_file_flag) {
+             fprintf(stderr, "[!] Enter your 2FA code into rootfs/%s/2fa.txt\n", args_info.base_dir_arg);
+@@ -309,6 +331,8 @@ static void credentialHandler(struct shared_ptr *credReqHandler,
+     union std_string password = new_std_string(amPassword);
+     _ZN17storeservicescore19CredentialsResponse11setPasswordERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE(
+         credResp.obj, &password);
++    /* new_std_string borrows amPassword until setPassword copies it. */
++    amPassword[passLen] = 0;
+ 
+     _ZN17storeservicescore19CredentialsResponse15setResponseTypeENS0_12ResponseTypeE(
+         credResp.obj, 2);
+@@ -474,6 +498,7 @@ uint8_t login(struct shared_ptr reqCtx) {
+     const int respType =
+         _ZNK17storeservicescore20AuthenticateResponse12responseTypeEv(
+             resp->obj);
++    fprintf(stderr, "[plugin-auth] response_type=%d\n", respType);
+     if (respType != 6) {
+         const char *customer_msg = std_string_data(
+             _ZNK17storeservicescore20AuthenticateResponse15customerMessageEv(resp->obj));
+@@ -482,6 +507,7 @@ uint8_t login(struct shared_ptr reqCtx) {
+ 
+         struct shared_ptr *err = _ZNK17storeservicescore20AuthenticateResponse5errorEv(resp->obj);
+         if (err != NULL && err->obj != NULL) {
++            fprintf(stderr, "[plugin-auth] external_error=%ld\n", plugin_external_auth_error(err->obj));
+             int code = _ZNK17storeservicescore19StoreErrorCondition9errorCodeEv(err->obj);
+             const char *what = _ZNK17storeservicescore19StoreErrorCondition4whatEv(err->obj);
+             fprintf(stderr, "[!] auth error: code=%d, message=%s\n", code, what ? what : "none");
+@@ -569,6 +595,7 @@ void *getKdContext(const char *const adam,
+     union std_string protocolType = new_std_string("simplified");
+     union std_string fpsCert = new_std_string(fairplayCert);
+ 
++    fprintf(stderr, "[plugin-key] persistent_request\n");
+     struct shared_ptr persistK = {.obj = NULL};
+     _ZN21SVFootHillSessionCtrl16getPersistentKeyERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEES8_S8_S8_S8_S8_S8_S8_(
+         &persistK, FHinstance, &defaultId, &defaultId, &keyUri, &keyFormat,
+@@ -577,17 +604,7 @@ void *getKdContext(const char *const adam,
+     if (persistK.obj == NULL)
+         return NULL;
+ 
+-    // DUMP persistentKey (SVFootHillPKey: first field is std::string ckc)
+-    {
+-        union std_string *pkey = (union std_string *)persistK.obj;
+-        const char *pdata = std_string_data(pkey);
+-        fprintf(stderr, "[+] DUMP persistentKey: %s\n", pdata);
+-        char *pkey_path = strcat_b(args_info.base_dir_arg, "/persistent_key.txt");
+-        FILE *kf = fopen(pkey_path, "w");
+-        if (kf) { fprintf(kf, "%s", pdata); fclose(kf); }
+-        free(pkey_path);
+-    }
+-
++    fprintf(stderr, "[plugin-key] context_request\n");
+     struct shared_ptr SVFootHillPContext;
+     _ZN21SVFootHillSessionCtrl14decryptContextERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEERKN11SVDecryptor15SVDecryptorTypeERKb(
+         &SVFootHillPContext, FHinstance, persistK.obj);
+@@ -595,6 +612,7 @@ void *getKdContext(const char *const adam,
+     if (SVFootHillPContext.obj == NULL)
+         return NULL;
+ 
++    fprintf(stderr, "[plugin-key] context_ready\n");
+     void *kdContext =
+         *_ZNK18SVFootHillPContext9kdContextEv(SVFootHillPContext.obj);
+ 
+@@ -836,7 +854,7 @@ const char* get_m3u8_method_download(struct shared_ptr reqCtx, unsigned long ada
+ const char* get_m3u8_method_play(uint8_t leaseMgr[16], unsigned long adam, char **out_key) {
+     if (out_key) *out_key = NULL;
+     union std_string HLS = new_std_string_short_mode("HLS");
+-    struct std_vector HLSParam = new_std_vector(&HLS);
++    struct std_vector HLSParam = {.begin = &HLS, .end = (char*)&HLS + sizeof(HLS), .end_capacity = (char*)&HLS + sizeof(HLS)};
+     static uint8_t z0 = 0;
+     struct shared_ptr ptr_result;
+     _ZN22SVPlaybackLeaseManager12requestAssetERKmRKNSt6__ndk16vectorINS2_12basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEENS7_IS9_EEEERKb(
+@@ -887,6 +905,9 @@ const char* get_m3u8_method_play(uint8_t leaseMgr[16], unsigned long adam, char
+ 
+         return result;
+     } else {
++        fprintf(stderr, "[plugin-key] asset_error=%d\n", _ZNK23SVPlaybackAssetResponse9errorCodeEv(ptr_result.obj));
++        const char *message = std_string_data(plugin_asset_error_message(ptr_result.obj));
++        if (message && *message) fprintf(stderr, "[!] server message: %s\n", message);
+         return NULL;
+     }
+ }
+@@ -1839,13 +1860,9 @@ char *get_music_user_token(char *guid, char *authToken, struct shared_ptr reqCtx
+     union std_string bundleVersionHeader = new_std_string("X-Apple-Requesting-Bundle-Version");
+     union std_string bundleVersionValue = new_std_string("Music/4.9 Android/10 model/Samsung S9 build/7663313 (dt:66)");
+     _ZN13mediaplatform11HTTPMessage9setHeaderERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEES9_(httpMessage.obj, &bundleVersionHeader, &bundleVersionValue);
+-    size_t body_size = 512;
+-    char *body = (char *)malloc(body_size);
+-    if (body == NULL) {
+-        return "";
+-    }
++    char *body = drm_music_token_request(guid, authToken, getCurrentTimeMillis());
++    if (!body) return NULL;
+ 
+-    snprintf(body, body_size, "{\"guid\":\"%s\",\"assertion\":\"%s\",\"tcc-acceptance-date\":\"%lld\"}", guid, authToken, getCurrentTimeMillis());
+     _ZN13mediaplatform11HTTPMessage11setBodyDataEPcm(httpMessage.obj, body, strlen(body));
+     /* NOTE: do NOT free body before run() — new hybris stores pointer, not copy */
+     uint8_t *urlRequest = (uint8_t *)calloc(1, 2048);
+@@ -1925,29 +1942,19 @@ char* get_dev_token(struct shared_ptr reqCtx) {
+ }
+ 
+ void write_music_token(void) {
+-    int token_file_available = 0;
+-    if (file_exists(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"))) {
+-        FILE *fp = fopen(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"), "r");
+-        if (NULL != fp) {
+-            fseek (fp, 0, SEEK_END);
+-            long size = ftell(fp);
+-
+-            if (0 != size) {
+-                token_file_available = 1;
+-            }
+-        }
+-    }
+-    if (token_file_available) {
+-        char token[256];
+-        FILE *fp = fopen(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"), "r");
+-        fgets(token, sizeof(token), fp);
+-        fprintf(stderr, "[+] Music-Token: %.14s...\n", token);
++    if (!g_music_token || !*g_music_token) return;
++    char *path = strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN");
++    FILE *fp = fopen(path, "w");
++    free(path);
++    if (!fp) {
++        fprintf(stderr, "[!] session token persistence failed\n");
+         return;
+     }
+-    FILE *fp = fopen(strcat_b(args_info.base_dir_arg, "/MUSIC_TOKEN"), "w");
+-    fprintf(stderr, "[+] Music-Token: %.14s...\n", g_music_token);
+-    fprintf(fp, "%s", g_music_token);
+-    fclose(fp);
++    size_t length = strlen(g_music_token);
++    size_t written = fwrite(g_music_token, 1, length, fp);
++    int closed = fclose(fp);
++    if (written != length || closed != 0)
++        fprintf(stderr, "[!] session token persistence failed\n");
+ }
+ 
+ int offline_available() {
+@@ -1958,6 +1965,13 @@ int offline_available() {
+     if (!fairplay->obj) { free(fairplay); return 0; }
+     struct std_vector fairplay_status = _ZN17storeservicescore8FairPlay21getSubscriptionStatusEv(fairplay->obj);
+     char *begin_ptr = (char*)fairplay_status.begin;
++    /* An unauthenticated account can return an empty subscription vector. */
++    if (!begin_ptr || !fairplay_status.end ||
++        (uintptr_t)fairplay_status.end < (uintptr_t)begin_ptr + 32) {
++        free(fairplay);
++        return 0;
++    }
++    free(fairplay);
+     char *second_item_ptr = begin_ptr + 16;
+     int state = *(int*)((char*)second_item_ptr + 8);
+     if (state == 2 || state == 3) { // kFPSubscriptionCanPlayContent, kFPSubscriptionCanStreamAndPlayContent
+diff --git a/drm/native/main.cpp b/drm/native/main.cpp
+index 55003c7..7af1b9b 100644
+--- a/drm/native/main.cpp
++++ b/drm/native/main.cpp
+@@ -52,6 +52,7 @@
+ 
+ #include <atomic>
+ #include <condition_variable>
++#include <chrono>
+ #include <cstdio>
+ #include <cstring>
+ #include <exception>
+@@ -109,11 +110,14 @@ static const int kBackoffMaxIdx   = 4;
+ static std::mutex               g_recovery_mtx;
+ static std::condition_variable  g_recovery_cv;
+ static std::queue<int>          g_recovery_q;
++static bool                     g_recovery_stopping = true;
++static std::thread              g_recovery_thread;
+ 
+ static void schedule_recovery(int code)
+ {
+     {
+         std::lock_guard<std::mutex> lk(g_recovery_mtx);
++        if (g_recovery_stopping) return;
+         g_recovery_q.push(code);
+     }
+     g_recovery_cv.notify_one();
+@@ -134,8 +138,9 @@ static void recovery_worker()
+         {
+             std::unique_lock<std::mutex> lk(g_recovery_mtx);
+             g_recovery_cv.wait(lk, []{
+-                return !g_recovery_q.empty();
++                return g_recovery_stopping || !g_recovery_q.empty();
+             });
++            if (g_recovery_stopping) return;
+             // Drain the entire queue (coalescing).
+             while (!g_recovery_q.empty()) {
+                 burst.push_back(g_recovery_q.front());
+@@ -184,7 +189,12 @@ static void recovery_worker()
+                 "(Apple may still be rejecting — retrying indefinitely)\n",
+                 consec_fails + 1, delay);
+         }
+-        sleep(delay);
++        {
++            std::unique_lock<std::mutex> lk(g_recovery_mtx);
++            if (g_recovery_cv.wait_for(lk, std::chrono::seconds(delay), [] {
++                return g_recovery_stopping;
++            })) return;
++        }
+ 
+         // ── Enter Refreshing state — gate incoming client requests ──────────
+         g_recovery_state.store(RecoveryState::Refreshing);
+@@ -228,10 +238,31 @@ static void recovery_worker()
+ // Called from main() in main.c, after leaseMgr and FHinstance are ready.
+ extern "C" void start_recovery_thread(void)
+ {
+-    std::thread(recovery_worker).detach();
++    std::lock_guard<std::mutex> lk(g_recovery_mtx);
++    if (g_recovery_thread.joinable()) return;
++    g_recovery_stopping = false;
++    g_recovery_state.store(RecoveryState::Running);
++    g_recovery_thread = std::thread(recovery_worker);
+     fprintf(stderr, "[+] recovery thread started\n");
+ }
+ 
++/* Stop the worker before callbacks/contexts are torn down. Backoff waits are
++ * interruptible, so shutdown does not have to wait for the 30-second retry. */
++extern "C" void stop_recovery_thread(void)
++{
++    {
++        std::lock_guard<std::mutex> lk(g_recovery_mtx);
++        g_recovery_stopping = true;
++    }
++    g_recovery_cv.notify_all();
++    if (g_recovery_thread.joinable()) g_recovery_thread.join();
++    {
++        std::lock_guard<std::mutex> lk(g_recovery_mtx);
++        while (!g_recovery_q.empty()) g_recovery_q.pop();
++    }
++    g_recovery_state.store(RecoveryState::Running);
++}
++
+ // ---------------------------------------------------------------------------
+ // FairPlay decrypt exception shim
+ // ---------------------------------------------------------------------------
+diff --git a/sdk/drm/auth.go b/sdk/drm/auth.go
+index ca358ee..2589f0b 100644
+--- a/sdk/drm/auth.go
++++ b/sdk/drm/auth.go
+@@ -23,6 +23,7 @@ import (
+ // "email\x00password" without waiting — credentials were set in advance.
+ // For 2FA and device-approval challenges, Challenge blocks until SubmitReply.
+ type AuthCoordinator struct {
++	pending bool
+ 	stored  Credentials
+ 	replies chan string // SubmitReply sends here; Challenge reads here
+ 	mu      sync.Mutex
+@@ -49,8 +50,14 @@ func (a *AuthCoordinator) SetCredentials(creds Credentials) {
+ // SubmitReply delivers a challenge reply from the browser (e.g. a 2FA code).
+ // Returns an error if no challenge is currently pending.
+ func (a *AuthCoordinator) SubmitReply(reply string) error {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	if !a.pending {
++		return fmt.Errorf("no authentication challenge pending")
++	}
+ 	select {
+ 	case a.replies <- reply:
++		a.pending = false
+ 		return nil
+ 	default:
+ 		return fmt.Errorf("no authentication challenge pending")
+@@ -87,6 +94,12 @@ func (a *AuthCoordinator) Challenge(ctx context.Context, req AuthChallenge) (str
+ 		return "\x00", nil
+ 	}
+ 
++	a.mu.Lock()
++	if a.pending {
++		a.mu.Unlock()
++		return "", fmt.Errorf("authentication challenge already pending")
++	}
++
+ 	// Drain any stale reply BEFORE announcing the challenge: draining after
+ 	// would discard a reply the browser sends right after the announcement.
+ 	select {
+@@ -94,6 +107,10 @@ func (a *AuthCoordinator) Challenge(ctx context.Context, req AuthChallenge) (str
+ 	default:
+ 	}
+ 
++	a.pending = true
++	a.mu.Unlock()
++	defer func() { a.mu.Lock(); a.pending = false; a.mu.Unlock() }()
++
+ 	// Emit challenge to SSE so the browser knows to prompt the user.
+ 	if a.emitter != nil {
+ 		a.emitter(DRMSnapshot{
+diff --git a/sdk/drm/manager.go b/sdk/drm/manager.go
+index 8bd62d5..bb46809 100644
+--- a/sdk/drm/manager.go
++++ b/sdk/drm/manager.go
+@@ -268,6 +268,7 @@ func (m *DRMManager) ensureRunning(ctx context.Context) error {
+ //     fires Challenge(ChallengeCredentials) and AuthCoordinator replies.
+ func (m *DRMManager) Authenticate(ctx context.Context, creds Credentials) error {
+ 	m.auth.SetCredentials(creds) // stored in AuthCoordinator; used if challenged
++	defer m.auth.SetCredentials(Credentials{})
+ 	m.setManagerState(ManagerInitializing)
+ 
+ 	loginCtx, cancel := context.WithTimeout(ctx, m.policy.AuthTimeout)
+@@ -285,6 +286,7 @@ func (m *DRMManager) Authenticate(ctx context.Context, creds Credentials) error
+ 	loginCfg.Credentials = creds
+ 	authErr := m.backend.Start(loginCtx, loginCfg)
+ 	if authErr != nil {
++		m.mergeAndEmit(DRMSnapshot{State: DRMState{Authentication: AuthFailed, FairPlay: FairPlayFailed}})
+ 		m.setManagerState(ManagerFailed)
+ 		return fmt.Errorf("authenticate: %w", authErr)
+ 	}
+diff --git a/sdk/drm/native_backend.go b/sdk/drm/native_backend.go
+index 3a53c2e..65b335e 100644
+--- a/sdk/drm/native_backend.go
++++ b/sdk/drm/native_backend.go
+@@ -33,6 +33,7 @@ typedef struct drm_key_context *drm_key_context_handle_t;
+ int   drm_init(const drm_config *config);
+ void  drm_shutdown(void);
+ char *drm_get_account(void);
++char *drm_lib_get_account(void);
+ char *drm_get_hls_url(drm_adam_id_t asset_id);
+ int   drm_get_progressive_url(drm_adam_id_t asset_id, char **out_url, char **out_download_key, int *out_has_decryptor);
+ drm_key_context_handle_t drm_open_key_context(const char *asset_id_str, const char *media_uri);
+@@ -45,6 +46,7 @@ int   drm_is_recovery_active(void);
+ 
+ // ── drm_hybris.h declarations (libCoreFP.so / libandroidappmusic.so via hybris) ──
+ int   hybris_backend_init(const char *hybris_linker_dir, const char *lib64_dir, const char *hybris_core_path);
++char *drm_lib_get_m3u8(unsigned long adam_id);
+ int   hybris_fairplay_init(const char *base_dir, const char *device_info, const char *lib64_dir, const char *username, const char *password);
+ int   hybris_backend_decrypt(void *ctx, uint32_t selector, uint8_t *data, uint32_t len);
+ void *hybris_backend_open_kd_ctx(const uint8_t *ckc_data, uint32_t ckc_len, uint32_t selector);
+@@ -73,9 +75,6 @@ import (
+ 	"sync"
+ 	"time"
+ 	"unsafe"
+-
+-	"github.com/silentone12725/musickit-sdk-linux/sdk/aacstream"
+-	"github.com/silentone12725/musickit-sdk-linux/sdk/ampapi"
+ )
+ 
+ // nativeBackend implements the DRM backend using the native implementation
+@@ -87,12 +86,11 @@ type nativeBackend struct {
+ 	eventCh chan DRMEvent
+ 	running bool
+ 	// Global state callback channel for C callbacks
+-	stateCh      chan string
+-	stateHandle  cgo.Handle
+-	hybrisReady  bool          // whether hybris backend (libCoreFP.so / libandroidappmusic.so) loaded
+-	cachedDevTok string        // MusicKit developer JWT, fetched once on Start
+-	fpReady      chan struct{} // closed once hybris + FairPlay init succeeded
+-	fpOnce       sync.Once
++	stateCh     chan string
++	stateHandle cgo.Handle
++	hybrisReady bool          // whether hybris backend (libCoreFP.so / libandroidappmusic.so) loaded
++	fpReady     chan struct{} // closed once hybris + FairPlay init succeeded
++	fpOnce      sync.Once
+ 
+ 	// In-flight accounting for calls into the C library (guarded by mu). Stop must not
+ 	// tear the library down under a running call, and key contexts handed out by one
+@@ -152,6 +150,7 @@ func (b *nativeBackend) Start(ctx context.Context, cfg BackendConfig) error {
+ 	defer b.mu.Unlock()
+ 
+ 	b.config = cfg
++	b.config.Credentials = Credentials{}
+ 
+ 	// Start callback goroutines
+ 	go b.authLoop()
+@@ -206,6 +205,10 @@ func (b *nativeBackend) Start(ctx context.Context, cfg BackendConfig) error {
+ 		log.Printf("[drm] Android libraries: %s (%d files)", lib64Dir, n)
+ 	}
+ 
++	// Keep the callback context independent of mu: Start holds mu during login.
++	authHandle := cgo.NewHandle(nativeAuthContext{ctx, b.authSrc})
++	// The vendor may callback until process exit; keep the handle alive.
++
+ 	// Prepare config
+ 	cBaseDir := C.CString(baseDir)
+ 	var cLib64Dir *C.char
+@@ -222,7 +225,7 @@ func (b *nativeBackend) Start(ctx context.Context, cfg BackendConfig) error {
+ 		device_info:     cDeviceInfo,
+ 		offline_only:    0,
+ 		auth_callback:   (C.drm_auth_callback_t)(C.nativeBridgeAuth),
+-		auth_user_data:  nil,
++		auth_user_data:  unsafe.Pointer(uintptr(authHandle)),
+ 		state_callback:  (C.drm_state_callback_t)(C.nativeBridgeState),
+ 		// Pass stateCh as userdata via cgo.Handle
+ 		state_user_data: unsafe.Pointer(uintptr(b.stateHandle)),
+@@ -254,16 +257,6 @@ func (b *nativeBackend) Start(ctx context.Context, cfg BackendConfig) error {
+ 		return fmt.Errorf("drm_init failed with code %d", ret)
+ 	}
+ 
+-	// Fetch and cache the MusicKit developer JWT (used in AcquireKey's
+-	// Authorization header). This token is embedded in the web player JS and
+-	// does not require user credentials — it is safe to fetch on every Start.
+-	if tok, err := ampapi.GetToken(); err == nil && tok != "" {
+-		b.cachedDevTok = tok
+-		log.Printf("[drm] native: dev token fetched (%d bytes)", len(tok))
+-	} else {
+-		log.Printf("[drm] native: dev token fetch failed: %v", err)
+-	}
+-
+ 	// Initialise the hybris backend (libCoreFP.so + libandroidappmusic.so).
+ 	// The Android libs are embedded in libdrm_client.so; only the linker shim
+ 	// (hybris-linker/q.so) and the bionic system libs (lib64) come from disk.
+@@ -342,6 +335,9 @@ func (b *nativeBackend) Start(ctx context.Context, cfg BackendConfig) error {
+ 		}
+ 	}
+ 
++	if fpState != FairPlayReady {
++		return errors.New("native authentication or FairPlay initialization failed")
++	}
+ 	b.running = true
+ 	b.gen++
+ 
+@@ -409,7 +405,7 @@ func (b *nativeBackend) quiesce(timeout time.Duration) bool {
+ // inside the C library get a bounded time to finish before it is torn down.
+ func (b *nativeBackend) Stop() error {
+ 	if !b.quiesce(15 * time.Second) {
+-		log.Printf("[drm] Stop: calls still inside the DRM library after 15s — shutting down anyway")
++		return fmt.Errorf("DRM shutdown deferred: native calls still in flight after 15s")
+ 	}
+ 
+ 	b.mu.Lock()
+@@ -483,7 +479,7 @@ func (b *nativeBackend) GetM3U8(ctx context.Context, adamID uint64) (string, err
+ 		return "", err
+ 	}
+ 	defer leave()
+-	cURL := C.drm_get_hls_url(C.drm_adam_id_t(adamID))
++	cURL := C.drm_lib_get_m3u8(C.ulong(adamID))
+ 	if cURL == nil {
+ 		return "", fmt.Errorf("failed to get HLS URL for asset %d", adamID)
+ 	}
+@@ -499,7 +495,7 @@ func (b *nativeBackend) GetAccount(ctx context.Context) (AccountInfo, error) {
+ 		return AccountInfo{}, err
+ 	}
+ 	defer leave()
+-	cJSON := C.drm_get_account()
++	cJSON := C.drm_lib_get_account()
+ 	if cJSON == nil {
+ 		return AccountInfo{}, fmt.Errorf("failed to get account info")
+ 	}
+@@ -633,43 +629,9 @@ func (b *nativeBackend) DialCBCS(ctx context.Context) (net.Conn, error) {
+ 				return nil, fmt.Errorf("FairPlay not initialised after 30s; refusing to decrypt asset %s", adamID)
+ 			}
+ 
+-			// Parse key URI to extract kidBase64 and uriPrefix
+-			// Format: skd://itunes.apple.com/p1484937438/c6,kidBase64
+-			log.Printf("[drm] DialCBCS: raw key URI=%s", uri)
+-			commaIdx := strings.LastIndex(uri, ",")
+-			var uriPrefix, kidBase64 string
+-			if commaIdx >= 0 {
+-				uriPrefix = uri[:commaIdx]
+-				kidBase64 = uri[commaIdx+1:]
+-				log.Printf("[drm] DialCBCS: parsed uriPrefix=%s kidBase64=%s", uriPrefix, kidBase64)
+-			} else {
+-				uriPrefix = uri
+-				kidBase64 = ""
+-				log.Printf("[drm] DialCBCS: no comma in URI, using full URI as prefix")
+-			}
+-
+-			// Fetch license if we have kid info
+-			var fetchedKey []byte
+-			if kidBase64 != "" && adamID != "0" {
+-				log.Printf("[drm] DialCBCS: fetching license for adamID=%s kid=%s", adamID, kidBase64)
+-				// Get tokens from account info
+-				account, accErr := b.GetAccount(ctx)
+-				if accErr != nil {
+-					log.Printf("[drm] DialCBCS: failed to get account: %v", accErr)
+-				} else {
+-					// Fetch license using aacstream's AcquireKey.
+-					// token = developer JWT (Authorization: Bearer), mutoken = user music token.
+-					devTok := b.cachedDevTok
+-					if devTok == "" {
+-						devTok = account.DevToken
+-					}
+-					fetchedKey, err = aacstream.AcquireKey(ctx, adamID, kidBase64, uriPrefix, devTok, account.MusicToken, false)
+-					if err != nil {
+-						log.Printf("[drm] DialCBCS: failed to fetch license: %v", err)
+-					} else {
+-						log.Printf("[drm] DialCBCS: license fetched, key=%02x%02x...", fetchedKey[0], fetchedKey[1])
+-					}
+-				}
++			// ALAC key delivery stays inside the native FairPlay context.
++			if !strings.HasPrefix(uri, "skd://") {
++				return nil, errors.New("unsupported native FairPlay key URI")
+ 			}
+ 
+ 			leave, enterErr := b.enter(gen)
+@@ -689,18 +651,6 @@ func (b *nativeBackend) DialCBCS(ctx context.Context) (net.Conn, error) {
+ 			}
+ 			log.Printf("[drm] DialCBCS: key context opened successfully for adamID=%s", adamID)
+ 
+-			// Set the fetched key if available
+-			if len(fetchedKey) == 16 {
+-				// The sample-derived IV path uses this as its base value.
+-				zeroIV := make([]byte, 16)
+-				cKey := (*C.uint8_t)(unsafe.Pointer(&fetchedKey[0]))
+-				cIV := (*C.uint8_t)(unsafe.Pointer(&zeroIV[0]))
+-				if ret := C.drm_set_key_context_key(kdCtx, cKey, cIV); ret != 0 {
+-					log.Printf("[drm] DialCBCS: failed to set key context key: ret=%d", ret)
+-				} else {
+-					log.Printf("[drm] DialCBCS: key context key set successfully")
+-				}
+-			}
+ 			leave()
+ 
+ 			return func(sample []byte) error {
+diff --git a/sdk/drm/native_cgo_bridge.go b/sdk/drm/native_cgo_bridge.go
+index 0ffd84d..4e5ac9a 100644
+--- a/sdk/drm/native_cgo_bridge.go
++++ b/sdk/drm/native_cgo_bridge.go
+@@ -9,20 +9,41 @@ package drm
+ import "C"
+ 
+ import (
++	"context"
+ 	"runtime"
+ 	"runtime/cgo"
+ 	"unsafe"
+ )
+ 
++type nativeAuthContext struct {
++	ctx    context.Context
++	source AuthSource
++}
++
+ //export nativeBridgeAuth
+ func nativeBridgeAuth(cType *C.char, buf *C.char, size C.int, ud unsafe.Pointer) {
+-	runtime.LockOSThread()
+-	defer runtime.UnlockOSThread()
+-
+-	// Auth is handled via callbacks - for now just return empty
+-	if size > 0 {
+-		C.memset(unsafe.Pointer(buf), 0, C.size_t(size))
++	if size <= 0 || buf == nil {
++		return
++	}
++	C.memset(unsafe.Pointer(buf), 0, C.size_t(size))
++	if ud == nil || C.GoString(cType) != "2fa" {
++		return
++	}
++	auth := cgo.Handle(uintptr(ud)).Value().(nativeAuthContext)
++	if auth.source == nil {
++		return
++	}
++	reply, err := auth.source.Challenge(auth.ctx, AuthChallenge{Type: ChallengeTwoFactor, Title: "Verification code"})
++	if err != nil || len(reply) != 6 || int(size) < 7 {
++		return
++	}
++	for _, digit := range reply {
++		if digit < '0' || digit > '9' {
++			return
++		}
+ 	}
++	dst := unsafe.Slice((*byte)(unsafe.Pointer(buf)), int(size))
++	copy(dst, reply)
+ }
+ 
+ //export nativeBridgeState
+diff --git a/server/apiserver.go b/server/apiserver.go
+index 753e6e8..9cd414e 100644
+--- a/server/apiserver.go
++++ b/server/apiserver.go
+@@ -61,7 +61,6 @@ import (
+ 	"github.com/silentone12725/musickit-sdk-linux/sdk/playback"
+ 	"github.com/silentone12725/musickit-sdk-linux/sdk/prefetch"
+ 	"github.com/silentone12725/musickit-sdk-linux/sdk/ring"
+-	"github.com/silentone12725/musickit-sdk-linux/sdk/vlc"
+ )
+ 
+ // artworkClient is used for proxying artwork and catalog API responses.
+@@ -462,7 +461,6 @@ type APIServer struct {
+ 	diskCache   *diskcache.Cache    // per-track decrypted audio disk cache
+ 	alac        *alacGate           // parks background ALAC downloads while the player's track starts
+ 	libStore    *library.Store      // local library metadata cache (songs, playlists)
+-	vlcPlayer   *vlc.Player         // nil when libvlc is not available
+ 
+ 	tokenMu     sync.RWMutex
+ 	cachedToken string // bearer token cached from the most recent browser request
+@@ -680,6 +678,7 @@ func NewAPIServer(port int, cfg ServerConfig) *APIServer {
+ 
+ 	mux.HandleFunc("POST /api/v1/playback", cors(s.handleCreatePlayback))
+ 	mux.HandleFunc("GET /api/v1/playback/{id}/audio", cors(s.handlePlaybackAudio))
++	mux.HandleFunc("GET /api/v1/playback/{id}/complete-audio", cors(s.handleCompleteAudio))
+ 	mux.HandleFunc("GET /api/v1/playback/{id}/video", cors(s.handlePlaybackVideo))
+ 	mux.HandleFunc("GET /api/v1/playback/{id}/video-dl", cors(s.handlePlaybackVideoNative))
+ 	mux.HandleFunc("GET /api/v1/playback/{id}/video-dl-info", cors(s.handlePlaybackVideoNativeInfo))
+@@ -713,13 +712,6 @@ func NewAPIServer(port int, cfg ServerConfig) *APIServer {
+ 	mux.HandleFunc("GET /api/v1/lyrics/{id}", cors(s.handleLyrics))
+ 	mux.HandleFunc("GET /api/v1/audioanalysis/{id}", cors(s.handleAudioAnalysis))
+ 
+-	mux.HandleFunc("POST /api/v1/export", cors(s.handleExportCreate))
+-	mux.HandleFunc("GET /api/v1/export", cors(s.handleExportList))
+-	mux.HandleFunc("GET /api/v1/export/{id}", cors(s.handleExportGet))
+-	mux.HandleFunc("DELETE /api/v1/export/{id}", cors(s.handleExportCancel))
+-	mux.HandleFunc("POST /api/v1/export/{id}/retry", cors(s.handleExportRetry))
+-	mux.HandleFunc("POST /api/v1/export/{id}/priority", cors(s.handleExportPriority))
+-
+ 	// DRM subsystem — wrapper lifecycle, authentication, session management.
+ 	// The frontend expresses intent (login, submit 2FA); the engine orchestrates.
+ 	mux.HandleFunc("GET /api/v1/drm/status", cors(s.handleDRMStatus))
+@@ -742,6 +734,10 @@ func NewAPIServer(port int, cfg ServerConfig) *APIServer {
+ 	// Catalog — search and entity detail endpoints for frontend UIs.
+ 	// These are purely additive and proxy the Apple Music catalog API.
+ 	mux.HandleFunc("GET /api/v1/catalog/albums/{id}", cors(s.handleCatalogAlbum))
++	mux.HandleFunc("GET /api/v1/catalog/search", cors(s.handlePluginSearch))
++	mux.HandleFunc("GET /api/v1/catalog/storefront", cors(s.handlePluginStorefront))
++	mux.HandleFunc("GET /api/v1/catalog/discover", cors(s.handlePluginDiscover))
++	mux.HandleFunc("GET /api/v1/catalog/personal", cors(s.handlePluginPersonal))
+ 	mux.HandleFunc("GET /api/v1/catalog/playlists/{id}", cors(s.handleCatalogPlaylist))
+ 	mux.HandleFunc("GET /api/v1/catalog/artists/{id}", cors(s.handleCatalogArtist))
+ 
+@@ -753,20 +749,11 @@ func NewAPIServer(port int, cfg ServerConfig) *APIServer {
+ 
+ 	// VLC player — libvlc-backed playback for ALAC/Atmos that the browser cannot decode.
+ 	// Routes are no-ops when libvlc is not installed; frontend falls back to MSE.
+-	s.vlcPlayer, _ = vlc.New() // nil if libvlc unavailable
+-	mux.HandleFunc("POST /api/v1/vlc/load", cors(s.handleVLCLoad))
+-	mux.HandleFunc("POST /api/v1/vlc/pause", cors(s.handleVLCPause))
+-	mux.HandleFunc("POST /api/v1/vlc/resume", cors(s.handleVLCResume))
+-	mux.HandleFunc("POST /api/v1/vlc/stop", cors(s.handleVLCStop))
+-	mux.HandleFunc("GET /api/v1/vlc/time", cors(s.handleVLCTime))
+-	mux.HandleFunc("POST /api/v1/vlc/seek", cors(s.handleVLCSeek))
+-	mux.HandleFunc("POST /api/v1/vlc/volume", cors(s.handleVLCVolume))
+ 
+ 	// Benchmark/diagnostics surface (additive; no effect on playback).
+ 	// /api/v1/debug/runtime exposes scalar runtime metrics the harness samples
+ 	// (goroutines, heap, GC) — things only the engine process itself can report.
+ 	// /debug/pprof/* serves standard profiles for flamegraphs.
+-	mux.HandleFunc("GET /api/v1/debug/runtime", cors(s.handleRuntimeStats))
+ 	// pprof heap dumps expose in-memory key material; only register when MUSICKIT_DEBUG=1.
+ 	if os.Getenv("MUSICKIT_DEBUG") == "1" {
+ 		mux.HandleFunc("GET /debug/pprof/", httppprof.Index)
+@@ -869,9 +856,6 @@ func (s *APIServer) Start() error {
+ // The session DB is preserved so the next start reuses the session.
+ func (s *APIServer) Stop() {
+ 	// Stop VLC immediately so audio cuts off before the rest of the shutdown sequence.
+-	if s.vlcPlayer != nil {
+-		s.vlcPlayer.Close()
+-	}
+ 	// Cancel the server lifetime context to stop background goroutines.
+ 	s.shutdownStop()
+ 	// Stop the export worker before shutting down playback.
+@@ -981,9 +965,14 @@ func cors(h http.HandlerFunc) http.HandlerFunc {
+ 
+ // ── Helpers ───────────────────────────────────────────────────────────────────
+ 
+-// mediaUserToken returns the Media User Token from the DRM session file.
+-// Refreshed on every call so wrapper token rotations are picked up automatically.
++// mediaUserToken prefers the active native account, including token rotations.
+ func (s *APIServer) mediaUserToken() string {
++	if s.dm != nil && s.dm.Status().State.Manager == drm.ManagerReady && s.dm.Status().State.FairPlay == drm.FairPlayReady {
++		account, err := s.dm.GetAccount(context.Background())
++		if err == nil && account.MusicToken != "" {
++			return account.MusicToken
++		}
++	}
+ 	if s.session != nil {
+ 		if mt := s.session.ReadMusicToken(); mt != "" {
+ 			return mt
+@@ -1009,6 +998,12 @@ func (s *APIServer) token() string {
+ 	s.tokenMu.RLock()
+ 	t := s.cachedToken
+ 	s.tokenMu.RUnlock()
++	if t == "" && s.dm != nil && s.dm.Status().State.Manager == drm.ManagerReady && s.dm.Status().State.FairPlay == drm.FairPlayReady {
++		account, err := s.dm.GetAccount(context.Background())
++		if err == nil {
++			return account.DevToken
++		}
++	}
+ 	return t
+ }
+ 

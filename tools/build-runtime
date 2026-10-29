@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Build the pinned SDK in a disposable checkout; never fetch or publish code."""
+import json
+import hashlib
+import os
+from pathlib import Path
+import shutil
+import shlex
+import subprocess
+import sys
+
+root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(root / "src"))
+from apple_music_plugin.engine import SDK_REVISION
+
+if len(sys.argv) != 2:
+    raise SystemExit("Usage: python tools/build-runtime SDK_CHECKOUT")
+sdk = Path(sys.argv[1]).resolve()
+revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=sdk, text=True).strip()
+if revision != SDK_REVISION:
+    raise SystemExit("SDK revision differs from the reviewed revision")
+for path in (sdk / "drm/rootfs/system/lib64").glob("*.so"):
+    with path.open("rb") as binary:
+        if binary.read(4) != b"\x7fELF":
+            raise SystemExit("SDK native libraries are missing. Complete Git LFS checkout first.")
+
+# Apply reviewed native authentication repairs to the pinned source.
+patch = root / "patches/native-auth.patch"
+stamp = sdk / ".plugin-native-patch"
+patch_digest = hashlib.sha256(patch.read_bytes()).hexdigest()
+applied = subprocess.run(["git", "apply", "--reverse", "--check", str(patch)], cwd=sdk, capture_output=True)
+if applied.returncode and (not stamp.is_file() or stamp.read_text() != patch_digest):
+    subprocess.run(["git", "apply", "--check", str(patch)], cwd=sdk, check=True)
+    subprocess.run(["git", "apply", str(patch)], cwd=sdk, check=True)
+
+stamp.write_text(patch_digest)
+
+subprocess.run([sys.executable, str(root / "tools/test-credential-copy"), str(sdk)], check=True)
+
+subprocess.run([sys.executable, str(root / "tools/test-session-token"), str(sdk)], check=True)
+
+# Test fixtures are build-tagged and excluded from the distributed engine.
+for fixture in (root / "tools/runtime-tests").glob("*.go"):
+    shutil.copy2(fixture, sdk / "sdk/drm" / fixture.name)
+
+# Keep reviewed native headers alongside the reproducible source overlay.
+for header in (root / "runtime-source/native").glob("*.h"):
+    shutil.copy2(header, sdk / "drm/native" / header.name)
+
+# Keep the native file adapter as a source overlay, separate from vendor files.
+for source in (root / "runtime-source").rglob("*.go"):
+    target = sdk / source.relative_to(root / "runtime-source")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+
+subprocess.run([sys.executable, str(root / "tools/test-native-security"), str(sdk)], check=True)
+
+# AAC uses its web playback asset and does not require an enhanced HLS URL.
+provider = sdk / "sdk/apple/provider.go"
+source = provider.read_text()
+old = '\tif a.ExtendedAssetUrls.EnhancedHls == "" {\n\t\treturn nil, fmt.Errorf("no HLS URL for track %s", req.AssetID)\n\t}\n'
+if old in source:
+    source = source.replace(old, "", 1)
+    anchor = '\t\tmaster, err := hls.OpenMaster(ctx, a.ExtendedAssetUrls.EnhancedHls)'
+    assert source.count(anchor) == 1
+    source = source.replace(anchor, '\t\tif a.ExtendedAssetUrls.EnhancedHls == "" {\n\t\t\treturn nil, fmt.Errorf("no HLS URL for track %s", req.AssetID)\n\t\t}\n' + anchor)
+    provider.write_text(source)
+
+# Publish only the fresh public certificate to a private inherited path.
+# The adapter trusts this file, never an unverified network certificate.
+tls = sdk / "server/tlslocal.go"
+source = tls.read_text()
+if '"encoding/pem"' not in source:
+    source = source.replace('"crypto/tls"', '"crypto/tls"\n\t"encoding/pem"\n\t"os"')
+    anchor = "\tcert := tls.Certificate{"
+    assert source.count(anchor) == 1
+    source = source.replace(anchor, '''	if path := os.Getenv("MUSICKIT_CERT_FILE"); path != "" {
+		data := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+		if err := os.WriteFile(path + ".tmp", data, 0600); err != nil { return nil, err }
+		if err := os.Rename(path + ".tmp", path); err != nil { return nil, err }
+	}
+''' + anchor)
+    tls.write_text(source)
+
+# The SDK cannot outlive the plugin on a crash or forced host termination.
+main = sdk / "server/cmd/musickit-engine/main.go"
+source = main.read_text()
+if '"strconv"' not in source:
+    source = source.replace('"os/signal"', '"os/signal"\n\t"strconv"')
+    source = source.replace("func main() {", '''func main() {
+	if expected, err := strconv.Atoi(os.Getenv("MUSICKIT_PARENT_PID")); err == nil && expected > 1 {
+		go func() {
+			for { if os.Getppid() != expected { os.Exit(0) }; time.Sleep(time.Second) }
+		}()
+	}
+''', 1)
+    main.write_text(source)
+
+# Do not merely hide these features in the UI: omit their HTTP registrations.
+server = sdk / "server/apiserver.go"
+source = server.read_text().splitlines(keepends=True)
+excluded_routes = ("/api/v1/export", "/api/v1/vlc/", "/api/v1/debug/")
+source = "".join(line for line in source
+                 if not ("mux.HandleFunc(" in line and any(route in line for route in excluded_routes)))
+source = "".join(line for line in source.splitlines(keepends=True) if not any(
+    part in line for part in ('"github.com/silentone12725/musickit-sdk-linux/sdk/vlc"',
+                             'vlcPlayer   *vlc.Player', 's.vlcPlayer, _ = vlc.New()')))
+source = source.replace("\tif s.vlcPlayer != nil {\n\t\ts.vlcPlayer.Close()\n\t}\n", "")
+marker = '\tmux.HandleFunc("GET /api/v1/catalog/personal", cors(s.handlePluginPersonal))'
+for method in ("GET", "POST", "DELETE"):
+    route = f'\tmux.HandleFunc("{method} /api/v1/catalog/collection", cors(s.handlePluginCollection))'
+    if route not in source:
+        source = source.replace(marker, marker + "\n" + route)
+for method, path, handler in [("GET", "account", "Account"), ("POST", "play", "Play")]:
+    route = f'\tmux.HandleFunc("{method} /api/v1/reporting/{path}", cors(s.handlePluginReporting{handler}))'
+    if route not in source:
+        source = source.replace(marker, marker + "\n" + route)
+server.write_text(source)
+vlc_handlers = sdk / "server/handlers_vlc.go"
+source = vlc_handlers.read_text()
+if not source.startswith("//go:build"):
+    vlc_handlers.write_text("//go:build !native_backend\n\n" + source)
+subprocess.run(["gofmt", "-w", str(tls), str(main), str(server)], check=True)
+# Fortified libc diagnoses this unchecked read; fail closed on a truncated file.
+client = sdk / "drm/drm_client.c"
+source = client.read_text()
+source = source.replace("        fread(out_guid, 1, 36, f);\n        fclose(f);",
+                        "        size_t count = fread(out_guid, 1, 36, f);\n        fclose(f);\n        if (count != 36) return generate_uuid(out_guid, buf_size);")
+client.write_text(source)
+# Relink after linker policy changes even when object mtimes are unchanged.
+(sdk / "drm/libdrm_client.so").unlink(missing_ok=True)
+prefixes = [(str(Path.home()), "/build/home"), (str(root), "/build/source"), (str(sdk), "/build/sdk")]
+prefix_flags = [f"-{kind}-prefix-map={source}={target}" for source, target in prefixes
+                for kind in ("ffile", "fdebug", "fmacro")]
+subprocess.run(["clang++", *prefix_flags, "-shared", "-fPIC", "-nostdlib", "-fexceptions", "-funwind-tables",
+                "-Wl,--hash-style=both", "-Wl,-soname,libplugin_guard.so",
+                str(root / "runtime-source/native/plugin_guard.cpp"),
+                "-L" + str(sdk / "drm/rootfs/system/lib64"),
+                "-l:libc++_shared.so", "-l:libandroidappmusic.so",
+                "-o", str(sdk / "drm/rootfs/system/lib64/libplugin_guard.so")], check=True)
+# Rebuild generated objects when compiler path-mapping options change.
+objects = [sdk / "drm/drm_client.o", sdk / "drm/drm_hybris.o",
+           sdk / "drm/embedded_blobs/embedded_loader.o", *(sdk / "drm/native").glob("*.o")]
+for object_file in objects:
+    object_file.unlink(missing_ok=True)
+cc = shlex.join([*shlex.split(os.environ.get("CC", "gcc")), *prefix_flags])
+cxx = shlex.join([*shlex.split(os.environ.get("CXX", "c++")), *prefix_flags])
+subprocess.run(["make", "-j2", "-C", str(sdk / "drm"), f"CC={cc}", f"CXX={cxx}",
+                "android-stubs", "libdrm_client.so"], check=True)
+output = root / "runtime"
+output.mkdir(exist_ok=True)
+env = dict(os.environ, GOMAXPROCS="2", GOFLAGS="-p=2", GOPROXY="https://proxy.golang.org", GOSUMDB="sum.golang.org")
+subprocess.run([str(sdk / "scripts/build-engine.sh"), str(output), "-ldflags=-w -s", "-trimpath", "-buildvcs=false"], cwd=sdk, env=env, check=True)
+for name in ("rootfs/system/lib64", "hybris-linker"):
+    shutil.copytree(sdk / "drm" / name, output / "drm" / name, dirs_exist_ok=True)
+licenses = output / "licenses"
+licenses.mkdir(exist_ok=True)
+for name in ("LICENSE", "NOTICE.md", "drm/native/LICENSE.wrapper", "drm/native/LICENSE.cJSON"):
+    shutil.copy2(sdk / name, licenses / Path(name).name)
+shutil.copytree(sdk / "drm/vendor/libhybris", licenses / "libhybris", dirs_exist_ok=True)
+(output / "plugin-runtime.json").write_text(json.dumps({"revision": SDK_REVISION, "certificate_file": 1, "native_auth": 1, "complete_audio": 1, "listening_reports": 1}))
+# Preserve the precise local modifications alongside the build provenance.
+(output / "sdk.patch").write_bytes(subprocess.check_output(["git", "diff", "--", "server", "sdk/drm", "sdk/apple/provider.go", "drm/Makefile", "drm/drm_client.c", "drm/drm_hybris.c", "drm/native/drm_lib.c", "drm/native/main.c", "drm/native/main.cpp", "drm/native/hybris_stubs.c"], cwd=sdk))
+shutil.copytree(root / "runtime-source", output / "sdk-overlay", dirs_exist_ok=True)
+print(output)

@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""Run native regression fixtures against the exact SDK sources without an account."""
+from pathlib import Path
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+root = Path(__file__).resolve().parents[1]
+sdk = Path(sys.argv[1]).resolve()
+with tempfile.TemporaryDirectory(prefix='plugin-security-') as folder:
+    work = Path(folder)
+    (work/'native').symlink_to(sdk/'drm/native', target_is_directory=True)
+    shutil.copytree(root/'tools/security-tests', work/'tests')
+    env = dict(os.environ, ASAN_OPTIONS='detect_leaks=1:halt_on_error=1', UBSAN_OPTIONS='halt_on_error=1')
+    cases = [
+        ('cc', 'music_token_request_test.c', [str(sdk/'drm/native/cJSON.c')]),
+        ('c++', 'recovery_lifecycle_test.cpp', ['-std=c++17', '-pthread', '-ffunction-sections', '-fdata-sections', '-Wl,--gc-sections'])]
+    for compiler, name, extra in cases:
+        binary = work/name.split('.')[0]
+        subprocess.run([compiler, '-g', '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
+                        str(work/'tests'/name), *extra, '-o', str(binary)], check=True)
+        subprocess.run([str(binary)], check=True, env=env, timeout=15)

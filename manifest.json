@@ -1,0 +1,37 @@
+{
+  "id": "io.github.shinnycharizard.apple-music",
+  "name": "Apple Music",
+  "version": "1.0.1",
+  "api_version": 1,
+  "kind": "source",
+  "runtime": "process",
+  "description": "Apple Music for Linux x86_64. Subscription required. The local engine is included; the user explicitly downloads 22 pinned and verified Apple FairPlay libraries before sign-in. No virtual machine is required. AAC/Widevine-only tracks are not yet playable. The engine remains active for sign-in, two-factor authentication, and playback. Personal home includes recently played, mixes, new releases, and your playlists. Apple Music lyrics are available where provided, and unavailable playlist tracks are identified. Song, album, and artist favorites are separate from library actions. Search artists, songs, albums, and playlists by name or link. Temporary buffering only; no offline library.",
+  "icon": "icon.svg",
+  "folder_icon": "folder.svg",
+  "author": "ShinnyCharizard",
+  "capabilities": [
+    {
+      "type": "network",
+      "domains": [
+        "music.apple.com",
+        "amp-api.music.apple.com",
+        "play.itunes.apple.com",
+        "sf-api-token-service.itunes.apple.com",
+        "itunes.apple.com",
+        "mzstatic.com",
+        "universal-activity-service.itunes.apple.com",
+        "raw.githubusercontent.com"
+      ]
+    },
+    {
+      "type": "register_source"
+    },
+    {
+      "type": "register_panel"
+    },
+    {
+      "type": "own_account",
+      "keyring": false
+    }
+  ]
+}

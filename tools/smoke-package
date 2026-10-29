@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Run the packaged plugin under the host's native sandbox, without an account."""
+import http.client
+import json
+from pathlib import Path
+import shutil
+import selectors
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import urlsplit
+
+package = Path(sys.argv[1]).resolve()
+with tempfile.TemporaryDirectory(prefix='plugin-apple-package-') as temporary:
+    data, cache = Path(temporary)/'data', Path(temporary)/'cache'
+    data.mkdir(mode=0o700)
+    cache.mkdir(mode=0o700)
+    command = ['bwrap', '--unshare-all', '--share-net', '--die-with-parent', '--new-session', '--cap-drop', 'ALL',
+               '--ro-bind', '/usr', '/usr', '--symlink', 'usr/lib', '/lib', '--symlink', 'usr/lib64', '/lib64',
+               '--symlink', 'usr/bin', '/bin', '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp']
+    for item in ['ssl', 'ca-certificates', 'pki', 'resolv.conf', 'hosts', 'nsswitch.conf', 'ld.so.cache', 'ld.so.conf', 'ld.so.conf.d']:
+        command += ['--ro-bind-try', '/etc/'+item, '/etc/'+item]
+    command += ['--ro-bind', str(package), '/plugin', '--bind', str(data), '/data', '--bind', str(cache), '/cache',
+                '--chdir', '/data', '--clearenv', '--setenv', 'PATH', '/usr/bin', '--setenv', 'HOME', '/data',
+                '--setenv', 'XDG_CACHE_HOME', '/cache', '--setenv', 'SSL_CERT_DIR', '/etc/ssl/certs',
+                '--', '/usr/bin/prlimit', '--as=2147483648', '--nofile=256', '--core=0', '--', '/plugin/plugin']
+    child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    try:
+        def exchange(message):
+            child.stdin.write(json.dumps(message)+'\n')
+            child.stdin.flush()
+            with selectors.DefaultSelector() as ready:
+                ready.register(child.stdout, selectors.EVENT_READ)
+                assert ready.select(40), 'Packaged RPC timed out'
+            return json.loads(child.stdout.readline())
+        def call(identifier, method, params=None):
+            result = exchange({'jsonrpc': '2.0', 'id': identifier, 'method': method, 'params': params or {}})
+            assert result.get('id') == identifier and 'error' not in result, 'Packaged RPC failed'
+            return result['result']
+        assert call(1, 'initialize')['capabilities']['settings'] is True
+        for method in ([], {}):
+            invalid = exchange({'jsonrpc': '2.0', 'id': 90, 'method': method})
+            assert invalid.get('id') is None and invalid.get('error', {}).get('code') == -32600, 'Malformed method must remain a protocol error'
+        assert call(91, 'auth.status')['phase'] == 'setup', 'Malformed requests must not stop the packaged adapter'
+        form = call(2, 'settings.open')
+        assert not form['notices'], 'Runtime failed under host sandbox'
+        assert form['form']['actions'][0]['key'] == 'install_components', 'Install must require a click'
+        assert not form['links'], 'Sign-in must wait for FairPlay installation'
+        assert call(20, 'auth.status')['phase'] == 'setup', 'Missing components must not start the engine'
+        assert not (data/'fairplay').exists(), 'Opening settings must not download components'
+        if '--download-components' in sys.argv:
+            form = call(22, 'settings.submit', {'revision': form['revision'], 'action': 'install_components', 'values': {}})
+            deadline = time.monotonic() + 180
+            saw_progress = False
+            while time.monotonic() < deadline:
+                form = call(23, 'settings.open')
+                saw_progress |= (form.get('progress') or {}).get('done', 0) > 0
+                if form['links']:
+                    break
+                if form['status']['phase'] == 'failed':
+                    raise AssertionError('FairPlay download failed: ' + form['status']['description'])
+                time.sleep(.25)
+            else:
+                raise AssertionError('FairPlay download did not complete')
+            assert saw_progress and (data/'fairplay/drm/rootfs/system/lib64/libCoreFP.so').is_file()
+            print('PASS: explicit RPC download, live byte progress and verified files under host sandbox')
+        elif '--seed-verified-components' not in sys.argv:
+            child.stdin.close()
+            assert child.wait(timeout=15) == 0
+            print('PASS: packaged host sandbox, explicit install prompt, no download or engine before click')
+            raise SystemExit(0)
+        else:
+            local = Path(__file__).resolve().parents[1]/'runtime/drm'
+            shutil.copytree(local, data/'fairplay/drm')
+            form = call(21, 'settings.open')
+        deadline = time.monotonic() + 25
+        while not form['links'] and time.monotonic() < deadline:
+            assert form['status']['phase'] != 'failed', form['status']['description']
+            time.sleep(.1)
+            form = call(21, 'settings.open')
+        assert form['links'], 'The runtime did not finish startup within its deadline'
+        parsed = urlsplit(form['links'][0]['url'])
+        assert parsed.hostname == '127.0.0.1'
+        connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=10)
+        connection.request('GET', parsed.path+'status')
+        response = connection.getresponse()
+        state = json.loads(response.read())
+        connection.close()
+        assert response.status == 200 and state['phase'] == 'idle', 'Empty profile must request sign-in'
+        assert json.loads((data/'auth-status.json').read_text())['phase'] == 'idle'
+        if '--invalid-account' in sys.argv:
+            call(10, 'settings.submit', {'revision': form['revision'], 'action': 'sign_in',
+                 'values': {'email': 'fixture@example.invalid', 'password': 'intentionally-invalid'}})
+            deadline = time.monotonic() + 40
+            while time.monotonic() < deadline:
+                connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=10)
+                connection.request('GET', parsed.path+'status')
+                state = json.loads(connection.getresponse().read())
+                connection.close()
+                if state['phase'] == 'failed':
+                    diagnostic = json.loads((data/'auth-status.json').read_text())
+                    assert 'exit_code' not in diagnostic, 'Native engine crashed during authentication'
+                    assert diagnostic.get('error_code') == 10, 'Invalid fixture must expose the actual native error, not its address'
+                    assert diagnostic.get('stage') == 'credentials_requested', 'Credential callback was not observed'
+                    assert isinstance(diagnostic.get('response_type'), int) and diagnostic['response_type'] != 6, 'Missing native failure response'
+                    assert isinstance(diagnostic.get('external_error'), int), 'Missing external error code'
+                    assert 'customer_message' not in diagnostic, 'Customer message must not be persisted'
+                    assert 'Apple: ' in state['message'], 'Customer-facing error was swallowed'
+                    break
+                time.sleep(.25)
+            else:
+                raise AssertionError('Invalid account did not fail within deadline')
+            print('PASS: packaged negative login fails without native crash under original 2 GiB limit')
+        assert call(3, 'reporting.status')['upstream_supported']
+        assert call(4, 'reporting.status')['pending'] == 0
+        child.stdin.close()
+        assert child.wait(timeout=15) == 0
+        assert not list((data/'temporary').glob('run-*'))
+        print('PASS: packaged host sandbox, settings, browser polling, private status, shutdown; no account/audio')
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()

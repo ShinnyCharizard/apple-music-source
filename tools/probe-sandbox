@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+"""Match the host sandbox for the isolated negative-login diagnostic."""
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import sys
+root = Path(__file__).resolve().parents[1]
+with tempfile.TemporaryDirectory(prefix='plugin-apple-isolation-') as temporary:
+    data, cache = Path(temporary)/'data', Path(temporary)/'cache'
+    data.mkdir(mode=0o700)
+    cache.mkdir(mode=0o700)
+    command = ['bwrap', '--unshare-all', '--share-net', '--die-with-parent', '--new-session', '--cap-drop', 'ALL',
+               '--ro-bind', '/usr', '/usr', '--symlink', 'usr/lib', '/lib', '--symlink', 'usr/lib64', '/lib64',
+               '--symlink', 'usr/bin', '/bin', '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp']
+    for item in ['ssl','ca-certificates','pki','resolv.conf','hosts','nsswitch.conf','ld.so.cache','ld.so.conf','ld.so.conf.d']:
+        command += ['--ro-bind-try', '/etc/'+item, '/etc/'+item]
+    command += ['--ro-bind', str(root), '/plugin', '--bind', str(data), '/data', '--bind', str(cache), '/cache',
+                '--ro-bind', '/tmp/plugin-native-trace.so', '/trace.so',
+                '--chdir', '/data', '--clearenv', '--setenv', 'PATH', '/usr/bin', '--setenv', 'HOME', '/data',
+                '--setenv', 'XDG_CACHE_HOME', '/cache', '--setenv', 'SSL_CERT_DIR', '/etc/ssl/certs',
+                '--setenv', 'LD_PRELOAD', '/trace.so',
+                '--', '/usr/bin/prlimit', '--as=' + ('4294967296' if '--wide-address-space' in sys.argv else '2147483648'), '--nofile=256', '--core=0', '--',
+                '/usr/bin/python3', '/plugin/tools/probe-engine']
+    if '--bounded-arenas' in sys.argv:
+        index = command.index('--setenv')
+        command[index:index] = ['--setenv', 'MALLOC_ARENA_MAX', '2']
+    subprocess.run(command, env={}, check=True, timeout=55)

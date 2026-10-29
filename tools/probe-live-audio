@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""Exercise two catalog tracks through the active engine, without audio output."""
+import concurrent.futures
+import http.client
+import json
+from pathlib import Path
+import re
+import runpy
+import sys
+root = Path(__file__).resolve().parent
+sys.argv = [str(root/'probe-live-catalog'), '/drm/status']
+s = runpy.run_path(str(root/'probe-live-catalog'))
+headers = {'Authorization':'Bearer '+s['token'], 'Content-Type':'application/json'}
+def request(method, path, body=None):
+    connection = http.client.HTTPSConnection('127.0.0.1',s['port'],context=s['context'],timeout=45)
+    try:
+        connection.request(method,'/api/v1'+path,body=json.dumps(body) if body else None,headers=headers)
+        response=connection.getresponse()
+        return response.status,response.read(1024*1024),response.getheader('Content-Length')
+    finally: connection.close()
+sessions=[]
+try:
+    for asset in ('1713861904','1713861905'):
+        status,raw,_=request('POST','/playback',{'assetId':asset,'storefront':'us','capabilities':{'lossless':True,'atmos':False,'video':False}})
+        print('CREATE',asset,status,flush=True)
+        if status in (200,201):
+            sid=json.loads(raw).get('sessionId','')
+            if re.fullmatch('[A-Za-z0-9_-]{1,128}',sid):sessions.append((asset,sid))
+    def check(item):
+        asset,sid=item
+        status,_,length=request('HEAD','/playback/'+sid+'/complete-audio')
+        print('AUDIO',asset,status,length,flush=True)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(check,sessions))
+    status,raw,_=request('GET','/drm/status')
+    state=json.loads(raw).get('state',{}) if status==200 else {}
+    print('STATE', {k:state.get(k) for k in ('manager','process','authentication','fairplay')},flush=True)
+finally:
+    for _,sid in sessions:
+        try: request('DELETE','/playback/'+sid)
+        except Exception: pass

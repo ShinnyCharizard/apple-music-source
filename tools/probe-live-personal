@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""Read catalog metadata through the running plugin; never print credentials."""
+import http.client
+import json
+import os
+from pathlib import Path
+import ssl
+import sys
+
+# Read only the plugin engine's private API transport credentials into memory.
+# Never inspect account files, print environment values or dump API responses.
+for process in Path('/proc').iterdir():
+    if not process.name.isdigit():
+        continue
+    try:
+        if process.stat().st_uid != os.getuid():
+            continue
+        command = (process/'cmdline').read_bytes().split(b'\0')
+        if not command or not command[0].endswith(b'/musickit-engine') or b'--api' not in command:
+            continue
+        namespace = process/'root'
+        manifest = json.loads((namespace/'plugin/manifest.json').read_text())
+        if manifest.get('id') != 'io.github.shinnycharizard.apple-music':
+            continue
+        environment = dict(part.split(b'=', 1) for part in (process/'environ').read_bytes().split(b'\0') if b'=' in part)
+        token = environment[b'MUSICKIT_API_TOKEN'].decode()
+        certificate = namespace/os.fsdecode(environment[b'MUSICKIT_CERT_FILE']).lstrip('/')
+        context = ssl.create_default_context(cafile=str(certificate))
+        port = int(command[command.index(b'--api')+1])
+        break
+    except (OSError, ValueError, KeyError):
+        continue
+else:
+    raise SystemExit('No running installed plugin engine found')
+
+from collections import Counter
+for path in ['/recommendations?limit=25']:
+    conn = http.client.HTTPSConnection('127.0.0.1', port, context=context, timeout=30)
+    try:
+        conn.request('GET', '/api/v1'+path, headers={'Authorization': 'Bearer '+token})
+        response = conn.getresponse()
+        raw = response.read(8*1024*1024+1)
+        print('STATUS', path.split('?')[0], response.status, flush=True)
+        if response.status != 200 or len(raw) > 8*1024*1024: continue
+        value = json.loads(raw)
+        def summarize(row, depth=0):
+            attrs = row.get('attributes', {})
+            print('ROW', depth, row.get('type'), 'KIND', attrs.get('kind'), 'DISPLAY', attrs.get('display'), 'GROUP', attrs.get('isGroupRecommendation'), 'TITLE', attrs.get('title', attrs.get('name')), 'REASON', attrs.get('reason'), flush=True)
+            for key, rel in row.get('relationships', {}).items():
+                rows = rel.get('data', [])
+                print('REL', key, len(rows), dict(Counter(x.get('type') for x in rows)), 'NEXT', bool(rel.get('next')), flush=True)
+                if key == 'contents' and attrs.get('title', {}).get('stringForDisplay') == 'Playlists Made for You':
+                    print('PLAYLISTS', [(x.get('id'), x.get('attributes', {}).get('name')) for x in rows], flush=True)
+                if depth < 1 and key in ('recommendations', 'contents'):
+                    for child in rows[:12]:
+                        if child.get('type') == 'personal-recommendation': summarize(child, depth+1)
+        for row in value.get('data', [])[:30]: summarize(row)
+    finally:
+        conn.close()
