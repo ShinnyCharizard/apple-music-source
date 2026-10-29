@@ -48,6 +48,18 @@ audio. `python3 tools/smoke-package /path/to/package` checks sandbox startup,
 the explicit component installation step and shutdown. Signed-in checks need
 an explicit `PLUGIN_DATA_DIR`; they never select a personal profile for you.
 
+## Credits
+
+Built on [musickit-sdk-linux](https://github.com/silentone12725/musickit-sdk-linux)
+by [SilentOne](https://github.com/silentone12725). The native authentication,
+FairPlay integration and delivery runtime come from that project, with local
+adaptations for this plugin.
+
+The long-token serialisation and recovery lifecycle fixes were adapted from
+[apple-music-linux](https://github.com/silentone12725/apple-music-linux), also
+by SilentOne. Upstream wrapper and library notices are retained in `NOTICE`
+and the bundled licences.
+
 ## Licence
 
 The adapter is distributed under GPL-3.0-or-later. The native SDK and wrapper
