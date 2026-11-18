@@ -38,7 +38,7 @@ with tempfile.TemporaryDirectory(prefix='plugin-apple-package-') as temporary:
             result = exchange({'jsonrpc': '2.0', 'id': identifier, 'method': method, 'params': params or {}})
             assert result.get('id') == identifier and 'error' not in result, 'Packaged RPC failed'
             return result['result']
-        assert call(1, 'initialize')['capabilities']['settings'] is True
+        assert call(1, 'initialize', {'protocol':1,'data_dir':'/data','cache_dir':'/cache','locale':'en','network':{'enabled':False}})['capabilities']['settings'] is True
         for method in ([], {}):
             invalid = exchange({'jsonrpc': '2.0', 'id': 90, 'method': method})
             assert invalid.get('id') is None and invalid.get('error', {}).get('code') == -32600, 'Malformed method must remain a protocol error'
@@ -48,7 +48,7 @@ with tempfile.TemporaryDirectory(prefix='plugin-apple-package-') as temporary:
         assert form['form']['actions'][0]['key'] == 'install_components', 'Install must require a click'
         assert not form['links'], 'Sign-in must wait for FairPlay installation'
         assert call(20, 'auth.status')['phase'] == 'setup', 'Missing components must not start the engine'
-        assert not (data/'fairplay').exists(), 'Opening settings must not download components'
+        assert not (cache/'fairplay').exists(), 'Opening settings must not download components'
         if '--download-components' in sys.argv:
             form = call(22, 'settings.submit', {'revision': form['revision'], 'action': 'install_components', 'values': {}})
             deadline = time.monotonic() + 180
@@ -63,7 +63,7 @@ with tempfile.TemporaryDirectory(prefix='plugin-apple-package-') as temporary:
                 time.sleep(.25)
             else:
                 raise AssertionError('FairPlay download did not complete')
-            assert saw_progress and (data/'fairplay/drm/rootfs/system/lib64/libCoreFP.so').is_file()
+            assert saw_progress and (cache/'fairplay/drm/rootfs/system/lib64/libCoreFP.so').is_file()
             print('PASS: explicit RPC download, live byte progress and verified files under host sandbox')
         elif '--seed-verified-components' not in sys.argv:
             child.stdin.close()
@@ -72,7 +72,7 @@ with tempfile.TemporaryDirectory(prefix='plugin-apple-package-') as temporary:
             raise SystemExit(0)
         else:
             local = Path(__file__).resolve().parents[1]/'runtime/drm'
-            shutil.copytree(local, data/'fairplay/drm')
+            shutil.copytree(local, cache/'fairplay/drm')
             form = call(21, 'settings.open')
         deadline = time.monotonic() + 25
         while not form['links'] and time.monotonic() < deadline:
@@ -116,7 +116,7 @@ with tempfile.TemporaryDirectory(prefix='plugin-apple-package-') as temporary:
         assert call(4, 'reporting.status')['pending'] == 0
         child.stdin.close()
         assert child.wait(timeout=15) == 0
-        assert not list((data/'temporary').glob('run-*'))
+        assert not list(cache.glob('run-*'))
         print('PASS: packaged host sandbox, settings, browser polling, private status, shutdown; no account/audio')
     finally:
         if child.poll() is None:

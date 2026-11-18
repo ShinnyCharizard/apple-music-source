@@ -56,7 +56,7 @@ if os.environ.get('LD_PRELOAD'):
                 print('FRAME',line.decode().strip(),flush=True)
         child.stderr.close()
     Engine._diagnostics = trace_frames
-engine=Engine('/data',root/'runtime')
+engine=Engine('/data',root/'runtime','/data/diagnostic-cache')
 sessions=[]
 try:
     engine.start()

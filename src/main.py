@@ -7,11 +7,50 @@ import sys
 import queue
 import threading
 import time
-from apple_music_plugin.service import Service
+from apple_music_plugin.hybrid_service import Service
 from apple_music_plugin.state import Failure
 from apple_music_plugin.deadline import budget, RPC_SECONDS
+from apple_music_plugin.i18n import translate
 
 MAX_LINE = 64 * 1024
+
+
+class InitializedService:
+    """Storage and workers open only after a valid host greeting."""
+
+    def __init__(self, runtime, factory=Service):
+        self.runtime, self.factory = runtime, factory
+        self.service = None
+        self.locale = "en"
+
+    def handle(self, method, params):
+        if method == "initialize":
+            if self.service is not None:
+                raise Failure("The plugin is already initialized.", -32600)
+            if not isinstance(params, dict) or type(params.get("protocol")) is not int or params["protocol"] != 1:
+                raise Failure("Expected protocol 1 initialization.", -32602)
+            folders = {}
+            for key in ("data_dir", "cache_dir"):
+                value = params.get(key)
+                if not isinstance(value, str) or not Path(value).is_absolute():
+                    raise Failure(f"An absolute {key} is required.", -32602)
+                folders[key] = value
+            opened = self.factory(folders["data_dir"], self.runtime, cache=folders["cache_dir"])
+            try:
+                result = opened.handle(method, params)
+            except BaseException:
+                opened.close()
+                raise
+            self.service = opened
+            self.locale = opened.locale
+            return result
+        if self.service is None:
+            raise Failure("The plugin has not been initialized.", -32002)
+        return self.service.handle(method, params)
+
+    def close(self):
+        if self.service is not None:
+            self.service.close()
 
 
 class Dispatcher:
@@ -90,7 +129,7 @@ def reply(service, message):
     try:
         result = {"result": service.handle(message["method"], message.get("params", {}))}
     except Failure as error:
-        result = {"error": {"code": error.code, "message": str(error)}}
+        result = {"error": {"code": error.code, "message": translate(getattr(service, "locale", "en"), str(error))}}
         if error.data:
             result["error"]["data"] = error.data
     except Exception:
@@ -102,11 +141,10 @@ def reply(service, message):
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", default="/data")
     base = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[1]
     parser.add_argument("--runtime", default=str(base / "runtime"))
     args = parser.parse_args()
-    service = Service(args.data_dir, args.runtime)
+    service = InitializedService(args.runtime)
     dispatcher = Dispatcher(service, lambda answer: print(json.dumps(answer, ensure_ascii=False, allow_nan=False), flush=True))
     try:
         while line := sys.stdin.buffer.readline(MAX_LINE + 1):
@@ -115,7 +153,11 @@ def main():
                 break
             try:
                 message = json.loads(line)
-                dispatcher.submit(message)
+                if service.service is None or (isinstance(message, dict) and message.get("method") == "initialize"):
+                    # Complete initialization on the reader before dispatching later calls.
+                    dispatcher.emit(reply(service, message))
+                else:
+                    dispatcher.submit(message)
                 continue
             except (ValueError, UnicodeDecodeError):
                 answer = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Invalid JSON."}}

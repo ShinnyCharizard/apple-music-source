@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""Render the real native form with a synthetic account state and no login."""
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+from types import SimpleNamespace
+
+root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(root / "src"))
+from apple_music_plugin.setup_wizard import document
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("binary", type=Path)
+parser.add_argument("output", type=Path)
+parser.add_argument("--patterns", type=Path, required=True)
+parser.add_argument("--theme-root", required=True)
+parser.add_argument("--host-module", required=True)
+parser.add_argument("--host-id", required=True)
+parser.add_argument("--smoke-env", required=True)
+parser.add_argument("--renderer-env", required=True)
+parser.add_argument("--locale", choices=("en", "es"), default="en")
+args = parser.parse_args()
+state = SimpleNamespace(components_ready=lambda: True, login_status=lambda: {"phase": "idle", "signed_in": False},
+    audio_setup=SimpleNamespace(snapshot=lambda: {"busy": False, "action": None, "error": None}),
+    web_session=SimpleNamespace(connected=True), setup_step=3, setup_review=False, revision=1, auth_failure=None, locale=args.locale)
+view = document(state)
+args.output.parent.mkdir(parents=True, exist_ok=True)
+with tempfile.TemporaryDirectory(prefix="native-setup-preview-") as folder:
+    profile = Path(folder)
+    for path in ["config/" + args.host_id, "cache", "data", "runtime"]:
+        (profile / path).mkdir(parents=True)
+    (profile / "runtime").chmod(0o700)
+    (profile / "config" / args.host_id / "settings.conf").write_text("output = file:capture\nlanguage = " + args.locale + "\n[window]\nappearance.theme = dark\n")
+    fixture = profile / "preview.qml"
+    fixture.write_text('''import QtQuick
+import QtQuick.Window
+import HOST_MODULE
+import PATTERNS
+import THEME
+Window {
+    id: window
+    visible: true; width: 600; height: 570
+    color: Theme.color.surfaceWindow
+    Column {
+        anchors.centerIn: parent
+        width: parent.width - Metrics.gap24 * 2
+        spacing: Metrics.gap24
+        Text { text: "Apple Music"; color: Theme.color.textPrimary; font.pointSize: Type.titleSmall }
+        PluginSettingsForm { width: parent.width; document: DOCUMENT }
+    }
+    Timer {
+        interval: 500; running: true
+        onTriggered: window.contentItem.grabToImage(result => {
+            if (!result.saveToFile(OUTPUT)) { Qt.exit(1); return }
+            console.log("PREVIEW_READY"); Qt.quit()
+        })
+    }
+    Timer { interval: 10000; running: true; onTriggered: Qt.exit(1) }
+}
+'''.replace("HOST_MODULE", args.host_module).replace("PATTERNS", json.dumps(args.patterns.resolve().as_uri()))
+       .replace("THEME", json.dumps(args.theme_root)).replace("DOCUMENT", json.dumps(view, ensure_ascii=False))
+       .replace("OUTPUT", json.dumps(str(args.output.resolve()))))
+    environment = dict(os.environ, XDG_CONFIG_HOME=str(profile / "config"), XDG_DATA_HOME=str(profile / "data"),
+        XDG_CACHE_HOME=str(profile / "cache"), XDG_RUNTIME_DIR=str(profile / "runtime"), QT_QPA_PLATFORM="offscreen",
+        QT_NO_XDG_DESKTOP_PORTAL="1")
+    environment[args.smoke_env] = str(fixture)
+    environment[args.renderer_env] = "software"
+    result = subprocess.run(["timeout", "20s", "dbus-run-session", "--", str(args.binary.resolve())],
+                            env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if result.returncode or "PREVIEW_READY" not in result.stdout or any(x in result.stdout for x in ["TypeError:", "ReferenceError:", "is not a type"]):
+        print(result.stdout, file=sys.stderr)
+        raise SystemExit(1)
+    print(args.output.resolve())

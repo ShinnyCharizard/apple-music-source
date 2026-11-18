@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""Check public Apple bootstrap without account credentials or token output."""
+import datetime
+import json
+from pathlib import Path
+import sys
+import tempfile
+
+root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(root / "src"))
+from apple_music_plugin.web_session import WebSession, claims
+from apple_music_plugin.deadline import budget
+from apple_music_plugin.state import Failure
+
+try:
+    with tempfile.TemporaryDirectory(prefix="public-web-bootstrap-") as data, budget():
+        session = WebSession(Path(data))
+        token = session.developer_token()
+        print(json.dumps({"bootstrap": "ready", "expires_at": datetime.datetime.fromtimestamp(
+            claims(token)["exp"], datetime.timezone.utc).isoformat(), "account_used": False}))
+except Failure as error:
+    print(str(error), file=sys.stderr)
+    raise SystemExit(1)

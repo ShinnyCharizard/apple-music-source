@@ -14,12 +14,15 @@ from .state import Failure, private_dir, save
 from .streams import Streams
 from .reporting import Reports
 from .deadline import budget, remaining
+from .i18n import language, translate
 
 
 class Service:
-    def __init__(self, data, runtime=None, engine=None):
+    def __init__(self, data, runtime=None, engine=None, *, cache=None):
+        if engine is None and cache is None:
+            raise Failure("An absolute cache_dir is required.", -32602)
         self.data = private_dir(data)
-        self.engine = engine or Engine(self.data, runtime)
+        self.engine = engine or Engine(self.data, runtime, cache)
         self.catalog = Catalog(self.engine)
         self.streams = Streams(self.engine, self.catalog)
         self.playlists = Playlists(self.catalog)
@@ -129,8 +132,8 @@ class Service:
         try:
             status = self.status()
         except Failure as error:
-            return {"phase": "runtime_failed", "message": str(error), **(error.data or {})}
-        if status["phase"] in {"runtime_failed", "recovering"}:
+            status = {"phase": "runtime_failed", "message": str(error), **(error.data or {})}
+        if status["phase"] == "recovering":
             return status
         messages = {"idle": "Sign in with your Apple Account.",
                     "setup": "Install the FairPlay components in plugin settings first.",
@@ -138,22 +141,23 @@ class Service:
                     "pending": "Restoring the saved session or completing sign-in. Enter a code only if Apple requests it.",
                     "challenge": "Enter the six-digit code from Apple.",
                     "ready": "Sign-in and FairPlay are ready. Return to your player to play music.",
-                    "failed": self.auth_failure or "Apple Music sign-in failed. Check your account and connection, then try again."}
+                    "failed": self.auth_failure or "Apple Music sign-in failed. Check your account and connection, then try again.",
+                    "runtime_failed": status.get("message", "The playback runtime is unavailable.")}
         diagnostic = {"phase": status["phase"], **getattr(self.engine, "diagnostic", {})}
         if diagnostic != self.last_diagnostic:
             save(self.data / "auth-status.json", diagnostic)
             self.last_diagnostic = diagnostic
-        message = messages[status["phase"]]
-        if status["phase"] == "failed":
+        message = translate(self.locale, messages[status["phase"]])
+        if status["phase"] in {"failed", "runtime_failed"}:
             if diagnostic.get("unsupported_dialog"):
-                message = "Apple requested a dialog this engine cannot display yet. Sign-in was not completed."
+                message = translate(self.locale, "Apple requested a dialog this engine cannot display yet. Sign-in was not completed.")
             customer_message = getattr(self.engine, "customer_message", None)
             if customer_message:
-                message += " Apple: " + customer_message
+                message += " " + translate(self.locale, "Apple: {message}", message=customer_message)
             if "error_code" in diagnostic:
-                message += f" Engine code: {diagnostic['error_code']}."
+                message += " " + translate(self.locale, "Engine code: {code}.", code=diagnostic['error_code'])
             if diagnostic.get("external_error"):
-                message += f" External code: {diagnostic['external_error']}."
+                message += " " + translate(self.locale, "External code: {code}.", code=diagnostic['external_error'])
         return {**status, "message": message}
 
     def settings(self, notice=None):
@@ -180,7 +184,7 @@ class Service:
         if phase == "runtime_failed":
             actions.append({"key": "retry_runtime", "label": "Retry runtime", "fields": []})
         if phase == "ready":
-            actions.append({"key": "sign_out", "label": "Sign out", "fields": []})
+            actions.append({"key": "sign_out", "label": "Sign out", "fields": [], "destructive": "account"})
         link = {"label": "Manage account" if phase == "ready" else "Reconnect" if phase == "expired" else "Open sign-in",
                 "url": self.login.url, "primary": phase != "ready"}
         document = {"revision": self.revision, "form": {"fields": [], "actions": actions, "unsupported": []},
@@ -321,7 +325,7 @@ class Service:
         if not isinstance(params, dict):
             raise Failure("Invalid operation parameters.", -32602)
         if method == "initialize":
-            self.locale = "es" if str(params.get("locale", "en")).startswith("es") else "en"
+            self.locale = language(params.get("locale", "en"))
             return {"protocol": 1, "capabilities": {"auth": "settings", "settings": True, "search": True, "scene_search_limit": 5, "resolve": True,
                     "home": True, "pages": True, "playback_events": 1, "track_lyrics": 1, "playlist_edit": False, "folder_edit": False, "favorites": True,
                     "library": ["playlists", "tracks", "albums", "artists"], "navigation": {"discover": "Apple Music"}}}

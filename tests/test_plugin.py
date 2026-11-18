@@ -76,7 +76,9 @@ class FakeEngine:
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 
-    def request(self, method, path, body=None, timeout=30):
+    def request(self, method, path, body=None, timeout=30, can_send=None):
+        if can_send is not None and not can_send():
+            raise Failure("The fixture account operation was cancelled.", data={"category": "cancelled"})
         self.calls.append((method, path, body))
         if path == "/reporting/account":
             return {"account": "fixture-account"}
@@ -560,14 +562,14 @@ class Plugin(unittest.TestCase):
 class RuntimePolicies(unittest.TestCase):
     def test_exclusive_profile_and_stale_buffer_cleanup(self):
         with tempfile.TemporaryDirectory() as tmp:
-            stale = Path(tmp) / "temporary/run-old"
+            stale = Path(tmp) / "cache/run-old"
             stale.mkdir(parents=True)
             (stale / "audio").write_bytes(b"old")
-            engine = Engine(tmp, "/missing-runtime")
+            engine = Engine(tmp, "/missing-runtime", Path(tmp) / "cache")
             try:
                 self.assertFalse(stale.exists())
                 with self.assertRaises(Failure):
-                    Engine(tmp, "/missing-runtime")
+                    Engine(tmp, "/missing-runtime", Path(tmp) / "cache")
                 for method, path in [("POST", "/export"), ("GET", "/debug/runtime"), ("POST", "/vlc/load"), ("GET", "https://evil.invalid")]:
                     with self.assertRaises(Failure):
                         engine.request(method, path)
@@ -576,7 +578,7 @@ class RuntimePolicies(unittest.TestCase):
 
     def test_missing_runtime_is_actionable(self):
         with tempfile.TemporaryDirectory() as tmp:
-            engine = Engine(tmp, "/missing-runtime")
+            engine = Engine(tmp, "/missing-runtime", Path(tmp) / "cache")
             try:
                 with self.assertRaisesRegex(Failure, "has not been built"):
                     engine.start()

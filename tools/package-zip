@@ -27,7 +27,8 @@ expanded = sum(path.stat().st_size for path in files)
 if expanded > 128 * 1024 * 1024:
     raise SystemExit("The package exceeds the host's 128 MiB expanded limit")
 try:
-    with zipfile.ZipFile(archive, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as output:
+    with zipfile.ZipFile(archive, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=6,
+                         strict_timestamps=False) as output:
         for path in files:
             output.write(path, arcname=path.relative_to(package.parent))
     if archive.stat().st_size > 64 * 1024 * 1024:

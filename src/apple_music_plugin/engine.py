@@ -24,9 +24,10 @@ MAX_JSON = 8 * 1024 * 1024
 
 
 class Engine:
-    def __init__(self, data, runtime):
+    def __init__(self, data, runtime, cache):
         self.data, self.runtime = private_dir(data), Path(runtime).resolve()
-        self.components = FairPlayComponents(self.data, self.runtime)
+        self.cache_root = private_dir(cache)
+        self.components = FairPlayComponents(self.cache_root, self.runtime)
         self.lock = threading.RLock()
         self.child = self.work = self.context = None
         self.token = ""
@@ -43,7 +44,6 @@ class Engine:
             raise Failure("Another Apple Music plugin owns this account.") from None
         # Remove an obsolete vendor debug artifact; account state is untouched.
         (self.data / "session/persistent_key.txt").unlink(missing_ok=True)
-        self.cache_root = private_dir(self.data / "temporary")
         # The lease proves that these are abandoned runs, not another player's cache.
         for path in self.cache_root.glob("run-*"):
             if path.is_dir() and not path.is_symlink():
@@ -100,6 +100,11 @@ class Engine:
                 env.pop("LD_LIBRARY_PATH", None)
                 if original:
                     env["LD_LIBRARY_PATH"] = original
+            # The engine's libraries belong to its package, independently of
+            # PyInstaller's libraries and of the system's OpenSSL/curl versions.
+            native_libraries = self.runtime / "native-libs"
+            if native_libraries.is_dir():
+                env["LD_LIBRARY_PATH"] = str(native_libraries)
             env.update(HOME=str(self.work), XDG_CACHE_HOME=str(self.work / "cache"),
                        XDG_CONFIG_HOME=str(self.work / "config"), TMPDIR=str(self.work),
                        MUSICKIT_DRM_DIR=str(self.components.root),
@@ -337,7 +342,7 @@ class Engine:
                 raise Failure("The Apple Music engine closed while restoring the session.")
             time.sleep(0.1)
 
-    def request(self, method, path, body=None, timeout=30):
+    def request(self, method, path, body=None, timeout=30, can_send=None):
         # The adapter never exposes a generic SDK proxy, exports, VLC or debug routes.
         allowed = (
             method == "GET" and re.fullmatch(r"/(status|capabilities|drm/status|catalog/storefront|metadata/[0-9]+\?sf=[a-z]{2}|catalog/albums/[0-9]+\?sf=[a-z]{2})", path)
@@ -354,6 +359,8 @@ class Engine:
         if not allowed:
             raise Failure("Unsupported runtime operation.", -32601)
         with budget():
+            if can_send is not None and not can_send():
+                raise Failure("The account operation was cancelled.", data={"category": "cancelled", "retryable": False})
             self.start()
             if not self.operations.acquire(timeout=remaining()):
                 raise Failure("The runtime is busy. Retry after the current operation finishes.", data={"category": "runtime", "reason": "busy", "retryable": True})
@@ -361,6 +368,8 @@ class Engine:
             try:
                 if path.startswith(("/catalog/", "/metadata/")) or (method == "POST" and path == "/playback"):
                     self.wait_account()
+                if can_send is not None and not can_send():
+                    raise Failure("The account operation was cancelled.", data={"category": "cancelled", "retryable": False})
                 sent = True
                 return self._json(method, path, body, timeout=timeout)
             except Failure as error:

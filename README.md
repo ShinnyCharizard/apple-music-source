@@ -1,67 +1,95 @@
-# Apple Music source
+# Apple Music (Lossless)
 
-Browse your Apple Music catalogue, manage favourites and play music through a
-local native runtime. You'll need an Apple Music subscription. For now, the
-runtime supports Linux x86_64.
+Apple Music web browsing with a separate native lossless playback session.
+This version replaces the earlier source under the same plugin ID. Linux
+x86_64 and an Apple Music subscription are required. The separate experimental
+lossless plugin has a different ID; its sessions are not imported.
+Music browsing uses the name Apple Music; the plugin list distinguishes this
+package as Apple Music (Lossless). Setup follows the player's language for
+English and Spanish, with English used for other languages.
 
-## Getting started
+## Connect your account
 
-The package includes the local engine and adapters. Choose Install in the
-settings page to download the 22 pinned FairPlay libraries. Each file is
-checked against its recorded size and SHA-256 digest; Apple's libraries are
-not included in the package.
+Open the source's settings and follow its numbered assistant:
 
-Sign in and enter verification codes through a private page in your browser.
-The runtime looks after the session, without saving your password or
-verification codes. Preferences and account files stay in the plugin's private
-storage. Signing out removes the saved account session.
+1. Prepare playback. Download the pinned playback components when prompted.
+   The engine is included; Apple's libraries are downloaded only after a click.
+2. Connect your web library. Open Apple's authorization window from the assistant.
+   Return after granting access; the assistant checks the account's storefront.
+3. Connect lossless playback. Enter the same Apple Account and password in the
+   assistant, then enter Apple's verification code there if requested.
+4. Review both connections. Disconnecting the web library keeps native playback
+   and active audio tickets. Disconnecting playback keeps the web account.
 
-## Music and your library
+Native engine startup and code submission run in a single bounded background
+operation so the assistant can keep showing progress. Cancellation finishes
+cleaning up the previous attempt before accepting another. Apple's sign-in
+errors and numeric diagnostic codes are shown in the assistant; a verification
+field is displayed when the native engine actually requests a code.
 
-Browse personal recommendations, recently played items, mixes, playlists,
-albums and artists. Favourites and library actions are separate. Account
-folders are read-only. Lyrics include timing and translation markup where
-provided.
+The native numbered step display requires a host with the generic setup-wizard
+renderer. Older hosts can show the same fields and actions as a regular form.
+The public Apple web bootstrap is discovered at connection time; this source
+does not depend on a third-party token service. A successful bootstrap check
+does not establish that browser authorization or authenticated playback works.
 
-The local audio relay uses opaque tickets, so runtime credentials never reach
-the player. Lossless ALAC playback uses complete temporary buffering;
-AAC/Widevine-only tracks aren't supported. The decoder measures the delivered
-sample rate and bit depth rather than guessing from catalogue data. If the
-runtime needs to recover, it keeps the account, revokes stale tickets and
-avoids replaying an account or playback action whose outcome is uncertain.
+The web credential is saved as `web-account.json` in this source's private
+data directory with mode 0600. Native session files remain in that directory's
+`session` subdirectory. Passwords and verification codes are never saved or
+returned to the settings form. No session is imported from another source.
 
-## A few rough edges
+## Current implementation
 
-Search can run into rate limits, and there may be a wait between searches.
-We're aware of both and are working on them.
+Web recommendations preserve ordinary recommendation shelves and their server
+order. New releases, catalog search, personal playlists, artists, albums and
+lyrics use the web client. The library has separate paged views for songs,
+albums, artists and playlists; library membership does not imply a favorite.
+Imported songs without a playable catalog counterpart remain visible as
+unavailable. Favorites and library actions remain distinct.
 
-## Building and checking
+Playback uses the existing native FairPlay runtime and opaque local audio
+tickets. Audio delivery and format reporting stay on that path; the decoder
+measures the delivered resolution. This source does not substitute web playback
+for the native lossless stream.
 
-Use Python 3.11 or later. Build the pinned runtime in a disposable SDK checkout
-with `python3 tools/build-runtime /path/to/sdk`, then package the adapter with
-`python3 tools/build-native` and `python3 tools/package-zip`. The SDK revision
-is pinned in `src/apple_music_plugin/engine.py`.
+Playlist and folder editing, station/video resource types and full visual
+parity are not included in this first implementation. Playlist folders are
+read-only. Those capabilities stay disabled until their operations are ready.
+Live double sign-in and listening require validation with the listener's account.
 
-Run the adapter tests with `PYTHONPATH=src python3 -m unittest discover -s tests`.
-`python3 tools/smoke-runtime` checks an isolated engine without credentials or
-audio. `python3 tools/smoke-package /path/to/package` checks sandbox startup,
-the explicit component installation step and shutdown. Signed-in checks need
-an explicit `PLUGIN_DATA_DIR`; they never select a personal profile for you.
+## Build and check
 
-## Credits
+The process follows SDK revision `76a4ad5`'s strict folder contract. It waits
+for `initialize` and requires absolute `data_dir` and `cache_dir` paths.
+Account state remains in `data_dir`; downloaded playback components and
+disposable engine runs live in `cache_dir`. Components kept by an earlier
+version may need downloading again. The package is found relative to its
+executable. No writable Linux mount name or working directory is assumed.
+The build bundles the native engine's non-glibc library dependencies in
+`runtime/native-libs`, including OpenSSL and curl, with their SHA-256 inventory.
+Set `NATIVE_LIBRARY_SYSROOT` to a compatible Linux runtime's `files` directory
+to select its library closure. Packaging rejects ELF files needing glibc newer
+than 2.39, and `abi.json` records the requirement of every packaged ELF.
 
-Built on [musickit-sdk-linux](https://github.com/silentone12725/musickit-sdk-linux)
-by [SilentOne](https://github.com/silentone12725). The native authentication,
-FairPlay integration and delivery runtime come from that project, with local
-adaptations for this plugin.
+Use Python 3.11 or later. Build the pinned native runtime in a disposable SDK
+checkout with `python3 tools/build-runtime /path/to/sdk`; its revision is
+recorded in `src/apple_music_plugin/engine.py`. Then use a Python environment
+with PyInstaller to run `python3 tools/build-native` and
+`python3 tools/package-zip`. The package excludes Apple's libraries.
 
-The long-token serialisation and recovery lifecycle fixes were adapted from
-[apple-music-linux](https://github.com/silentone12725/apple-music-linux), also
-by SilentOne. Upstream wrapper and library notices are retained in `NOTICE`
-and the bundled licences.
+Run `PYTHONPATH=src python3 -m unittest discover -s tests` for fixture tests.
+`python3 tools/probe-web-bootstrap` checks only Apple's public bootstrap and
+prints status and expiry without printing any token or using an account.
+`python3 tools/smoke-runtime` exercises an isolated engine without credentials
+or audio. Signed-in probes need an explicit isolated `PLUGIN_DATA_DIR`.
 
-## Licence
+## Credits and licence
 
-The adapter is distributed under GPL-3.0-or-later. The native SDK and wrapper
-retain their upstream notices. Apple's native libraries have their own
-licences; the SDK's MIT licence does not cover them. See `COPYING` and `NOTICE`.
+The native runtime and its local adaptations are preserved from Apple Music
+source. The runtime is based on
+[musickit-sdk-linux](https://github.com/silentone12725/musickit-sdk-linux) and
+[apple-music-linux](https://github.com/silentone12725/apple-music-linux) by
+SilentOne. Their notices remain in `NOTICE` and the runtime's licence files.
+
+The adapter is GPL-3.0-or-later. Apple's libraries retain their own licences
+and are not redistributed in the package. See `COPYING` and `NOTICE`.

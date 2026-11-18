@@ -41,7 +41,7 @@ def trace(self, child):
         child.stderr.close()
 Engine._diagnostics = trace
 with tempfile.TemporaryDirectory(prefix='engine-probe-') as temporary:
-    engine = Engine(temporary, root/'runtime')
+    engine = Engine(Path(temporary)/'data', root/'runtime', Path(temporary)/'cache')
     try:
         engine.request('POST', '/drm/authenticate', {'email': 'fixture@example.invalid', 'password': 'intentionally-invalid'})
         deadline = time.monotonic()+40

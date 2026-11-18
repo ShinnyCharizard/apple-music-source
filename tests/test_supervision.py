@@ -184,6 +184,18 @@ class TransportTests(unittest.TestCase):
             self.assertFalse(caught.exception.data["retryable"])
             self.assertEqual(caught.exception.data["outcome"], "unknown")
 
+    def test_cancelled_account_startup_does_not_send_credentials_after_launch(self):
+        engine = self.engine()
+        cancelled = threading.Event()
+        engine.start = Mock(side_effect=cancelled.set)
+        engine._json = Mock()
+        with self.assertRaises(Failure) as caught:
+            engine.request("POST", "/drm/authenticate", {"email": "fixture@example.invalid", "password": "private-password"},
+                           can_send=lambda: not cancelled.is_set())
+        self.assertEqual(caught.exception.data["category"], "cancelled")
+        engine.start.assert_called_once()
+        engine._json.assert_not_called()
+
     def test_serial_lane_does_not_run_native_operations_in_parallel(self):
         engine = self.engine()
         active, maximum = 0, 0

@@ -76,7 +76,7 @@ class FairPlayInstallation(unittest.TestCase):
         self.assertFalse(list(self.components.library_dir.glob(".fairplay-*")))
 
     def test_settings_exposes_explicit_install_without_starting_engine(self):
-        service = Service(self.data, self.runtime)
+        service = Service(self.data, self.runtime, cache=self.data / "cache")
         try:
             with patch.object(service.engine, "request", side_effect=AssertionError("engine started")):
                 form = service.handle("settings.open", {})

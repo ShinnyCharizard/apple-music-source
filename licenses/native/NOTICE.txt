@@ -1,0 +1,11 @@
+Native engine dependency libraries are packaged with their existing licences.
+OpenSSL: Apache-2.0, https://www.openssl.org/
+curl: curl licence, https://curl.se/docs/copyright.html
+libstdc++: GPL-3.0 with GCC Runtime Library Exception, https://gcc.gnu.org/onlinedocs/libstdc++/manual/license.html
+nghttp2: MIT, https://nghttp2.org/
+libpsl: MIT, https://github.com/rockdaboot/libpsl
+libidn2: LGPL-3.0-or-later, https://www.gnu.org/software/libidn/
+libunistring: LGPL-3.0-or-later or GPL-2.0-or-later, https://www.gnu.org/software/libunistring/
+zstd: BSD-3-Clause or GPL-2.0, https://facebook.github.io/zstd/
+zlib: Zlib, https://zlib.net/
+The exact packaged objects and SHA-256 are listed in runtime/native-libs/libraries.json.

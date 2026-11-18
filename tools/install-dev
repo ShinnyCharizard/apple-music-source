@@ -15,7 +15,7 @@ parser.add_argument('plugins', type=Path)
 parser.add_argument('--replace', action='store_true')
 args = parser.parse_args()
 manifest = json.loads((args.package / 'manifest.json').read_text())
-if manifest['id'] != 'io.github.shinnycharizard.apple-music' or not (args.package / 'plugin').is_file():
+if manifest['id'] != 'io.github.shinnycharizard.apple-music-hybrid' or not (args.package / 'plugin').is_file():
     raise SystemExit('This is not an Apple Music development package')
 args.plugins.mkdir(parents=True, exist_ok=True)
 target = args.plugins / manifest['id']
@@ -30,6 +30,9 @@ with tempfile.TemporaryDirectory(prefix='.install-apple-', dir=args.plugins) as 
         previous = json.loads((target / 'manifest.json').read_text())
         if previous.get('id') != manifest['id']:
             raise SystemExit('Existing package identity does not match')
+        origin = target / 'source.json'
+        if origin.is_file() and not origin.is_symlink():
+            shutil.copy2(origin, staged / 'source.json')
         # An active bwrap bind keeps the previous directory inode and libraries.
         # Swap complete directories; never rewrite a running mapped executable.
         libc = ctypes.CDLL(None, use_errno=True)

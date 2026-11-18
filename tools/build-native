@@ -23,6 +23,7 @@ for name, size, digest in vendor:
         raise SystemExit(f"Pinned FairPlay checksum differs: {name}")
 subprocess.run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--onedir",
                 "--name", "plugin", "--paths", str(root / "src"), "--strip",
+                "--exclude-module", "termios",
                 "--add-data", str(root / "src/apple_music_plugin/fairplay-libs.lock") + ":apple_music_plugin",
                 "--add-data", str(root / "src/apple_music_plugin/fairplay-sizes.json") + ":apple_music_plugin",
                 "--distpath", str(root / "build/package"), "--workpath", str(root / "build/work"),
@@ -35,6 +36,9 @@ shutil.copytree(root / "build/package/plugin", target)
 vendor_names = {name for name, _, _ in vendor}
 shutil.copytree(runtime, target / "runtime", ignore=lambda directory, names:
                 vendor_names & set(names) if Path(directory) == library_dir else set())
+subprocess.run([sys.executable, str(root / "tools/bundle-native-libraries"),
+                str(target / "runtime")], check=True)
+shutil.copytree(root / "licenses/native", target / "runtime/licenses/native", dirs_exist_ok=True)
 if {path.name for path in (target / "runtime/drm/rootfs/system/lib64").iterdir()} != set(COMPANIONS):
     raise SystemExit("Apple libraries entered the package")
 shutil.copytree(root / "src", target / "source", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))

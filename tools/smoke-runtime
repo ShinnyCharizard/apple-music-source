@@ -12,7 +12,7 @@ sys.path.insert(0, str(root / "src"))
 from apple_music_plugin.engine import Engine
 
 with tempfile.TemporaryDirectory(prefix="plugin-apple-smoke-") as temporary:
-    engine = Engine(temporary, root / "runtime")
+    engine = Engine(Path(temporary) / "data", root / "runtime", Path(temporary) / "cache")
     try:
         # Stage only verified local build inputs in this disposable profile.
         # An installed package still requires the user's explicit download.

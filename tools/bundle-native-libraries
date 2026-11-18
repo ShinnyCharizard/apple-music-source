@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Bundle the native engine's non-glibc ELF dependency closure."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+
+runtime = Path(sys.argv[1]).resolve(strict=True)
+output = runtime / "native-libs"
+output.mkdir(exist_ok=True)
+baseline = {"libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0",
+            "librt.so.1", "libresolv.so.2", "libgcc_s.so.1"}
+sysroot = os.environ.get("NATIVE_LIBRARY_SYSROOT")
+library_roots = ([Path(sysroot) / "lib/x86_64-linux-gnu", Path(sysroot) / "lib64"]
+                 if sysroot else [])
+listing = subprocess.check_output(["ldd", str(runtime / "musickit-engine")], text=True)
+host = dict(re.findall(r"^\s*(\S+) => (/\S+) \(", listing, re.MULTILINE))
+records = []
+pending = [runtime / "musickit-engine"]
+seen = set()
+while pending:
+    binary = pending.pop()
+    dynamic = subprocess.check_output(["readelf", "-d", str(binary)], text=True)
+    for name in re.findall(r"\(NEEDED\).*\[(.*?)\]", dynamic):
+        if name in baseline or name.startswith("ld-linux-") or name in seen:
+            continue
+        seen.add(name)
+        candidates = [runtime / name, *(p / name for p in library_roots)]
+        if name in host:
+            candidates.append(Path(host[name]))
+        path = next((p.resolve() for p in candidates if p.is_file()), None)
+        if path is None:
+            raise SystemExit("Missing native dependency: " + name)
+        if not path.is_relative_to(runtime):
+            shutil.copy2(path, output / name)
+            records.append({"file": name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+        pending.append(path)
+(output / "libraries.json").write_text(json.dumps(records, indent=2) + "\n")
+print("Bundled", len(records), "native dependency libraries")
+
+abi = []
+for path in runtime.parent.rglob("*"):
+    if not path.is_file():
+        continue
+    with path.open("rb") as source:
+        if source.read(4) != b"\x7fELF":
+            continue
+    info = subprocess.check_output(["readelf", "--version-info", str(path)], text=True)
+    versions = re.findall(r"GLIBC_(\d+\.\d+(?:\.\d+)?)", info)
+    maximum = max(versions, key=lambda s: tuple(map(int, s.split(".")))) if versions else None
+    if maximum and tuple(map(int, maximum.split("."))) > (2, 39):
+        raise SystemExit("Library exceeds glibc 2.39: " + str(path.relative_to(runtime.parent)))
+    abi.append({"file": str(path.relative_to(runtime.parent)), "max_glibc": maximum})
+(runtime.parent / "abi.json").write_text(json.dumps(abi, indent=2) + "\n")
