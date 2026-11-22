@@ -60,6 +60,10 @@ class WebAdapter:
                 raise Failure("Unsupported web catalog section.", -32602)
             if section == "recommendations":
                 params = recommendation_params()
+            elif section == "playlist":
+                # A single playlist is not a paginated collection. Apple rejects
+                # its header request with limit=100 before tracks can be read.
+                params = {}
             elif section == "folder-root":
                 params = {"filter[identity]": "playlistsroot"}
             elif section == "songs":

@@ -1,6 +1,7 @@
 import unittest
+from datetime import date
 from apple_music_plugin.catalog import Catalog, from_link, reference
-from apple_music_plugin.discovery import Discovery
+from apple_music_plugin.discovery import Discovery, genre_shelves
 from apple_music_plugin.playlists import Playlists
 from apple_music_plugin.state import Failure
 
@@ -73,6 +74,19 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(filtered['genre_filter'], '21')
         self.assertEqual(filtered['shelves'][0]['title'], 'Rock · Top albums')
         self.assertEqual(filtered['shelves'][0]['items'][0]['ref'], 'album:mx:123')
+
+    def test_genre_discovery_keeps_release_dates_and_artist_identities(self):
+        def album(identifier, released, artist_id):
+            row = item("albums", identifier)
+            row["attributes"].update(releaseDate=released, artistName="Performer")
+            row["relationships"] = {"artists":{"data":[{"type":"artists","id":artist_id}]}}
+            return row
+        chart = {"results":{"albums":[{"data":[album("1","2001-02-03","7"), album("2","2026-04-15","7"),
+                                              album("3","2026-05-12","8"), album("4","2027-01-01","9")]}]}}
+        result = genre_shelves(chart, "mx", lambda row: row, today=date(2026,6,1))
+        self.assertEqual([row["ref"] for row in result["shelves"][0]["items"]], ["album:mx:3","album:mx:2"])
+        self.assertEqual([row["ref"] for row in result["shelves"][1]["items"]], ["artist:mx:7","artist:mx:8","artist:mx:9"])
+        self.assertEqual(self.page.page({"ref":"genre-discovery","filters":{"genre":"Unknown"}}), {"shelves":[]})
 
     def test_unavailable_genres_leave_personal_home_usable(self):
         self.engine.fail = 'genres'

@@ -6,6 +6,7 @@ from .catalog import card
 from .state import Failure
 from .web_adapter import recommendation_params
 from .i18n import translate
+from .discovery import genre_name, genre_shelves
 
 KINDS = {"songs": "track", "albums": "album", "playlists": "playlist", "artists": "artist"}
 
@@ -65,6 +66,8 @@ class WebDiscovery:
             self.clear()
         sf = self.catalog.storefront()
         locale = self.client.language
+        if ref == "genre-discovery":
+            return self.genre_discovery(params, sf)
         tabs = [{"title": translate(locale, "For You"), "ref": "discover:home", "active": ref == "discover:home"},
                 {"title": translate(locale, "New"), "ref": "discover:browse", "active": ref == "discover:browse"},
                 {"title": translate(locale, "Your library"), "ref": "library:tracks", "active": ref.startswith("library:")}]
@@ -110,6 +113,18 @@ class WebDiscovery:
                 shelf["more"] = continuation(next_page)
             shelves.append(shelf)
         return {"title": "Apple Music", "personal": ref == "discover:home", "tab": "home", "tabs": tabs, "shelves": shelves}
+
+    def genre_discovery(self, params, sf):
+        name = genre_name(params)
+        genres = self.client.request(f"/v1/catalog/{sf}/genres", {"limit": "100"})
+        genre = next((str(row["id"]) for row in genres.get("data", [])
+                      if str(row.get("attributes", {}).get("name", "")).strip().casefold() == name
+                      and re.fullmatch(r"[0-9]{1,8}", str(row.get("id", "")))), None)
+        if genre is None:
+            return {"shelves": []}
+        chart = self.client.request(f"/v1/catalog/{sf}/charts",
+                                    {"genre": genre, "types": "albums", "limit": "60", "include[albums]": "artists"})
+        return genre_shelves(chart, sf, lambda row: resource(row, chart))
 
     def library_page(self, ref, sf, tabs):
         if ref.startswith("web-page:"):

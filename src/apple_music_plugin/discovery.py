@@ -1,10 +1,56 @@
 """Personal listening shelves; generic editorial recommendations stay out."""
 from copy import deepcopy
+from datetime import date, timedelta
 import hashlib
 import time
 import re
 from .catalog import card
 from .state import Failure
+
+
+def genre_name(params):
+    filters = params.get("filters")
+    name = filters.get("genre") if isinstance(filters, dict) else None
+    if not isinstance(name, str) or not name.strip() or len(name.encode()) > 1024:
+        raise Failure("Invalid genre name.", -32602)
+    return name.strip().casefold()
+
+
+def genre_shelves(chart, sf, resolve, today=None):
+    today = today or date.today()
+    earliest = today - timedelta(days=180)
+    releases, artists, seen = [], [], set()
+    charts = chart.get("results", {}).get("albums", [])
+    for group in charts:
+        for link in group.get("data", [])[:100]:
+            raw = resolve(link)
+            try:
+                album = card(raw, "album", sf)
+            except (Failure, TypeError, AttributeError):
+                continue
+            try:
+                released = date.fromisoformat(album.get("release_date", "")[:10])
+            except (TypeError, ValueError):
+                released = None
+            if released and earliest <= released <= today:
+                releases.append((released, album))
+            links = raw.get("relationships", {}).get("artists", {}).get("data", [])
+            for artist_link in links:
+                artist_raw = resolve(artist_link)
+                if len(links) == 1 and not artist_raw.get("attributes") and album.get("artist"):
+                    artist_raw = {**artist_raw, "attributes": {"name": album["artist"]}}
+                try:
+                    artist = card(artist_raw, "artist", sf)
+                except (Failure, TypeError, AttributeError):
+                    continue
+                if artist["title"] and artist["ref"] not in seen:
+                    seen.add(artist["ref"])
+                    artists.append(artist)
+    releases.sort(key=lambda row: row[0], reverse=True)
+    return {"shelves": [
+        {"id": "new_releases", "title": "New releases", "kind": "album", "items": [album for _, album in releases[:60]]},
+        {"id": "artists", "title": "Artists", "kind": "artist", "items": artists[:60]},
+    ]}
 
 
 class Discovery:
@@ -36,6 +82,8 @@ class Discovery:
         return items
 
     def page(self, params):
+        if params.get("ref") == "genre-discovery":
+            return self.genre_discovery(params)
         match = re.fullmatch(r"discover:home(?::([0-9,]*))?", params.get("ref", "discover:home"))
         if not match:
             raise Failure("Unknown discovery page.", -32602)
@@ -104,6 +152,17 @@ class Discovery:
                     if re.fullmatch(r"[0-9]{1,8}", str(row.get("id", ""))) and row.get("attributes", {}).get("name")]
         except Failure:
             return []
+
+    def genre_discovery(self, params):
+        name = genre_name(params)
+        if params.get("refresh"):
+            self.clear()
+        sf = self.catalog.storefront()
+        genre = next((row["id"] for row in self.genres(sf) if row["name"].strip().casefold() == name), None)
+        if genre is None:
+            return {"shelves": []}
+        chart = self.discover(sf, "charts", genre)
+        return genre_shelves(chart, sf, lambda row: row)
 
     def genre_page(self, sf, selected, genres):
         names = {row["id"]: row["name"] for row in genres}

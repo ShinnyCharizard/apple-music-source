@@ -327,7 +327,7 @@ class Service:
         if method == "initialize":
             self.locale = language(params.get("locale", "en"))
             return {"protocol": 1, "capabilities": {"auth": "settings", "settings": True, "search": True, "scene_search_limit": 5, "resolve": True,
-                    "home": True, "pages": True, "playback_events": 1, "track_lyrics": 1, "playlist_edit": False, "folder_edit": False, "favorites": True,
+                    "home": True, "pages": True, "genre_discovery": 1, "playback_events": 1, "track_lyrics": 1, "playlist_edit": False, "folder_edit": False, "favorites": True,
                     "library": ["playlists", "tracks", "albums", "artists"], "navigation": {"discover": "Apple Music"}}}
         if method == "inspect":
             return {"settings_pages": ["account"]}
